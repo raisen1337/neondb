@@ -33,6 +33,11 @@
    start neondb
    ```
 
+## 📗 NeonDB(the actual PostgreSQL database provider) official video:
+[![Watch the official NeonDB video](https://img.youtube.com/vi/llSTZMVrbx8/0.jpg)](https://www.youtube.com/watch?v=llSTZMVrbx8)
+
+[Watch on YouTube](https://www.youtube.com/watch?v=llSTZMVrbx8)
+
 ## ⚙️ Configuration
 
 Configure your database connection using convars in your `server.cfg`:
