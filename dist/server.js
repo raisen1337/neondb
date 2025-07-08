@@ -6789,6 +6789,38 @@
         return Promise.reject(error);
       }
     }
+    async getUniqueId(tableName, retryCount = 0) {
+      if (retryCount > 10) {
+        throw new Error(`Failed to generate unique ID for ${tableName} after 10 attempts`);
+      }
+      try {
+        // Get the current max ID and add a random offset to avoid collisions
+        const client = await this.pool.connect();
+        const result = await client.query(`SELECT COALESCE(MAX(id), 0) as max_id FROM ${tableName}`);
+        client.release();
+        const maxId = parseInt(result.rows[0].max_id);
+        const randomOffset = Math.floor(Math.random() * 100) + 1; // Random number between 1-100
+        const newId = maxId + randomOffset;
+
+        // Check if this ID already exists
+        const checkClient = await this.pool.connect();
+        const checkResult = await checkClient.query(`SELECT 1 FROM ${tableName} WHERE id = $1 LIMIT 1`, [newId]);
+        checkClient.release();
+        if (checkResult.rows.length > 0) {
+          // ID already exists, try again with a larger offset
+          console.log(`^3[oxpgsql] ^7ID ${newId} already exists in ${tableName}, retrying...`);
+          return this.getUniqueId(tableName, retryCount + 1);
+        }
+        return newId;
+      } catch (error) {
+        console.error(`^1[oxpgsql] ^7Error generating unique ID:`, error.message);
+
+        // Fallback to a large random number if all else fails
+        const fallbackId = Math.floor(1000000 + Math.random() * 8999999);
+        console.log(`^3[oxpgsql] ^7Using fallback random ID: ${fallbackId}`);
+        return fallbackId;
+      }
+    }
     async execute(query, parameters = [], callback = null) {
       if (!this.isReady) {
         const error = 'Database not ready';
