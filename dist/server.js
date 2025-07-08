@@ -6588,158 +6588,18 @@
       const parsedParams = this.parseParameters(parameters);
       let convertedQuery = this.convertMySQLToPostgreSQL(query);
 
-      // Check if this is an INSERT INTO inventory_items query
+      // Only attempt to fix inventory_items INSERT queries
       if (convertedQuery.includes('INSERT INTO inventory_items') && !convertedQuery.includes('(id,') && !convertedQuery.includes('(id ')) {
-        // Detect if it's a multi-row insert (has multiple value sets)
-        const isMultiRowInsert = (convertedQuery.match(/VALUES\s*\([^)]+\)/gi) || []).length > 1 || convertedQuery.includes('), (');
-        if (isMultiRowInsert) {
-          // Handle multi-row insert
-          try {
-            // Extract the table name
-            const tableNameMatch = convertedQuery.match(/INSERT\s+INTO\s+(\w+)/i);
-            const tableName = tableNameMatch ? tableNameMatch[1] : 'inventory_items';
+        try {
+          // Extract column list
+          const columnMatch = convertedQuery.match(/\(([^)]+)\)/);
+          if (columnMatch) {
+            const columns = columnMatch[1].trim();
 
-            // Extract column list
-            const columnMatch = convertedQuery.match(/\(([^)]+)\)/);
-            const columns = columnMatch ? columnMatch[1].trim() : '';
-
-            // Count how many rows are being inserted
-            const valueGroups = convertedQuery.match(/\([^)]+\)/g);
-            if (!valueGroups || valueGroups.length <= 1) {
-              throw new Error('Failed to parse multi-row insert');
-            }
-
-            // Remove the first match which is the column list
-            valueGroups.shift();
-
-            // Create individual INSERT statements for each row
-            const individualInserts = [];
-            let currentParamIndex = 0;
-            for (let i = 0; i < valueGroups.length; i++) {
-              // Count parameters in this value group
-              const valueGroup = valueGroups[i];
-              const paramCount = (valueGroup.match(/\$\d+/g) || []).length;
-
-              // Extract parameters for this row
-              const rowParams = parsedParams.slice(currentParamIndex, currentParamIndex + paramCount);
-              currentParamIndex += paramCount;
-
-              // Create an individual INSERT statement
-              const singleInsert = `
-                        INSERT INTO ${tableName} 
-                        (id, ${columns}) 
-                        VALUES 
-                        ((SELECT COALESCE(MAX(id), 0) + 1 FROM ${tableName}), ${rowParams.map((_, idx) => `$${idx + 1}`).join(', ')})
-                        RETURNING id
-                    `;
-              const client = await this.pool.connect();
-              const result = await client.query(singleInsert, rowParams);
-              client.release();
-              individualInserts.push({
-                id: result.rows[0].id,
-                affectedRows: result.rowCount || 0
-              });
-            }
-            console.log(`^2[oxpgsql] ^7Successfully executed ${individualInserts.length} individual INSERTs`);
-
-            // Create a combined result
-            const response = {
-              affectedRows: individualInserts.reduce((sum, item) => sum + item.affectedRows, 0),
-              insertId: individualInserts.length > 0 ? individualInserts[0].id : null,
-              warningCount: 0,
-              changedRows: individualInserts.reduce((sum, item) => sum + item.affectedRows, 0),
-              fieldCount: 0,
-              serverStatus: 2,
-              info: '',
-              executionTime: Date.now() - startTime
-            };
-            if (callback) callback(response);
-            return response;
-          } catch (multiError) {
-            console.error('^1[oxpgsql] ^7Failed to process multi-row INSERT:', multiError.message);
-            // Continue to try the original query
-          }
-        } else {
-          // Handle single-row insert
-          try {
-            // Extract column list and values
-            const columnMatch = convertedQuery.match(/\(([^)]+)\)/);
-            if (columnMatch) {
-              const columns = columnMatch[1].trim();
-
-              // Find VALUES clause
-              const valuesMatch = convertedQuery.match(/VALUES\s*\(([^)]+)\)/i);
-              if (valuesMatch) {
-                const values = valuesMatch[1].trim();
-
-                // Create a fixed query
-                const fixedQuery = `
-                            INSERT INTO inventory_items 
-                            (id, ${columns}) 
-                            VALUES 
-                            ((SELECT COALESCE(MAX(id), 0) + 1 FROM inventory_items), ${values})
-                            RETURNING id
-                        `;
-                const client = await this.pool.connect();
-                const result = await client.query(fixedQuery, parsedParams);
-                client.release();
-                const response = {
-                  affectedRows: result.rowCount || 0,
-                  insertId: result.rows[0].id,
-                  warningCount: 0,
-                  changedRows: result.rowCount || 0,
-                  fieldCount: result.fields ? result.fields.length : 0,
-                  serverStatus: 2,
-                  info: '',
-                  executionTime: Date.now() - startTime
-                };
-                console.log('^2[oxpgsql] ^7Auto-fixed inventory_items INSERT query');
-                if (callback) callback(response);
-                return response;
-              }
-            }
-          } catch (singleError) {
-            console.error('^1[oxpgsql] ^7Failed to fix single-row INSERT:', singleError.message);
-            // Continue to try the original query
-          }
-        }
-      }
-      try {
-        const client = await this.pool.connect();
-        const result = await client.query(convertedQuery, parsedParams);
-        client.release();
-        const executionTime = Date.now() - startTime;
-        this.queryCount++;
-        if (executionTime > this.slowQueryThreshold) {
-          console.warn(`^3[oxpgsql] ^7Slow query detected (${executionTime}ms):`, convertedQuery.substring(0, 100));
-        }
-        if (this.debugMode) {
-          console.log(`^3[oxpgsql] ^7Query executed in ${executionTime}ms:`, convertedQuery.substring(0, 100));
-        }
-        const response = {
-          affectedRows: result.rowCount || 0,
-          insertId: this.getInsertId(result),
-          warningCount: 0,
-          changedRows: result.rowCount || 0,
-          fieldCount: result.fields ? result.fields.length : 0,
-          serverStatus: 2,
-          info: '',
-          executionTime: executionTime
-        };
-        if (callback) callback(response);
-        return response;
-      } catch (error) {
-        console.error('^1[oxpgsql] ^7Execute error:', error.message);
-        console.error('^1[oxpgsql] ^7Query:', convertedQuery);
-        console.error('^1[oxpgsql] ^7Parameters:', parsedParams);
-
-        // Handle the specific inventory_items ID constraint violation
-        if (error.message.includes('violates not-null constraint') && error.message.includes('column "id"') && convertedQuery.includes('INSERT INTO inventory_items')) {
-          // Handle multi-row insert case
-          if (error.message.includes('VALUES lists must all be the same length') || (convertedQuery.match(/VALUES\s*\([^)]+\)/gi) || []).length > 1 || convertedQuery.includes('), (')) {
-            try {
-              // Break down the multi-row insert into individual inserts
-              // Extract parameters for each row based on the pattern in the error message
+            // Check if this is a multi-row insert
+            const isMultiRow = convertedQuery.includes('), (');
+            if (isMultiRow) {
+              // For multi-row inserts, we need to break it down into individual inserts
               // This is a simplified approach - parameters are grouped in sets of 7
               const rowSize = 7; // For inventory_items table
               const results = [];
@@ -6747,15 +6607,22 @@
                 const rowParams = parsedParams.slice(i, i + rowSize);
                 if (rowParams.length === rowSize) {
                   // Make sure we have a complete row
+                  // Generate a unique ID for this row
+                  const uniqueId = await this.getUniqueId('inventory_items');
+
+                  // Create a query for this specific row
                   const singleInsertQuery = `
                                 INSERT INTO inventory_items 
                                 (id, name, label, description, inventory_identifier, slot, amount, metadata) 
                                 VALUES 
-                                ((SELECT COALESCE(MAX(id), 0) + ${i / rowSize + 1} FROM inventory_items), $1, $2, $3, $4, $5, $6, $7)
+                                ($1, $2, $3, $4, $5, $6, $7, $8)
                                 RETURNING id
                             `;
+
+                  // Add the ID as the first parameter
+                  const rowParamsWithId = [uniqueId, ...rowParams];
                   const client = await this.pool.connect();
-                  const result = await client.query(singleInsertQuery, rowParams);
+                  const result = await client.query(singleInsertQuery, rowParamsWithId);
                   client.release();
                   results.push({
                     id: result.rows[0].id,
@@ -6778,21 +6645,24 @@
               console.log(`^2[oxpgsql] ^7Auto-fixed multi-row INSERT with ${results.length} individual inserts`);
               if (callback) callback(response);
               return response;
-            } catch (multiRowError) {
-              console.error('^1[oxpgsql] ^7Failed to fix multi-row INSERT:', multiRowError.message);
-            }
-          } else {
-            // Handle single-row insert (fallback from previous solution)
-            try {
+            } else {
+              // For single-row inserts
+              // Generate a unique ID
+              const uniqueId = await this.getUniqueId('inventory_items');
+
+              // Create a fixed query with the explicit ID
               const fixedQuery = `
                         INSERT INTO inventory_items 
-                        (id, name, label, description, inventory_identifier, slot, amount, metadata) 
+                        (id, ${columns}) 
                         VALUES 
-                        ((SELECT COALESCE(MAX(id), 0) + 1 FROM inventory_items), $1, $2, $3, $4, $5, $6, $7)
+                        ($1, ${parsedParams.map((_, i) => `$${i + 2}`).join(', ')})
                         RETURNING id
                     `;
+
+              // Add the ID as the first parameter
+              const paramsWithId = [uniqueId, ...parsedParams];
               const client = await this.pool.connect();
-              const result = await client.query(fixedQuery, parsedParams);
+              const result = await client.query(fixedQuery, paramsWithId);
               client.release();
               const response = {
                 affectedRows: result.rowCount || 0,
@@ -6804,12 +6674,326 @@
                 info: '',
                 executionTime: Date.now() - startTime
               };
-              console.log('^2[oxpgsql] ^7Auto-fixed inventory_items INSERT query');
+              console.log(`^2[oxpgsql] ^7Auto-fixed inventory_items INSERT query with ID ${uniqueId}`);
               if (callback) callback(response);
               return response;
-            } catch (singleRowError) {
-              console.error('^1[oxpgsql] ^7Failed to fix single-row INSERT:', singleRowError.message);
             }
+          }
+        } catch (fixError) {
+          console.error('^1[oxpgsql] ^7Failed to fix INSERT query:', fixError.message);
+          // Continue to try the original query
+        }
+      }
+      try {
+        const client = await this.pool.connect();
+        const result = await client.query(convertedQuery, parsedParams);
+        client.release();
+        const executionTime = Date.now() - startTime;
+        this.queryCount++;
+        if (executionTime > this.slowQueryThreshold) {
+          console.warn(`^3[oxpgsql] ^7Slow query detected (${executionTime}ms):`, convertedQuery.substring(0, 100));
+        }
+        const response = {
+          affectedRows: result.rowCount || 0,
+          insertId: this.getInsertId(result),
+          warningCount: 0,
+          changedRows: result.rowCount || 0,
+          fieldCount: result.fields ? result.fields.length : 0,
+          serverStatus: 2,
+          info: '',
+          executionTime: executionTime
+        };
+        if (callback) callback(response);
+        return response;
+      } catch (error) {
+        console.error('^1[oxpgsql] ^7Execute error:', error.message);
+        console.error('^1[oxpgsql] ^7Query:', convertedQuery);
+
+        // Handle ID constraint violation as a last resort
+        if (error.message.includes('violates not-null constraint') && error.message.includes('column "id"') && convertedQuery.includes('INSERT INTO inventory_items')) {
+          try {
+            // Generate a unique random ID in a higher range to avoid conflicts
+            const uniqueId = Math.floor(10000000 + Math.random() * 89999999);
+
+            // Create a completely new query with explicit column names
+            const lastResortQuery = `
+                    INSERT INTO inventory_items 
+                    (id, name, label, description, inventory_identifier, slot, amount, metadata) 
+                    VALUES 
+                    ($1, $2, $3, $4, $5, $6, $7, $8)
+                    RETURNING id
+                `;
+
+            // Add the ID as the first parameter
+            const lastResortParams = [uniqueId, ...parsedParams];
+            const client = await this.pool.connect();
+            const result = await client.query(lastResortQuery, lastResortParams);
+            client.release();
+            const response = {
+              affectedRows: result.rowCount || 0,
+              insertId: result.rows[0].id,
+              warningCount: 0,
+              changedRows: result.rowCount || 0,
+              fieldCount: result.fields ? result.fields.length : 0,
+              serverStatus: 2,
+              info: '',
+              executionTime: Date.now() - startTime
+            };
+            console.log(`^2[oxpgsql] ^7Last resort fix for inventory_items INSERT with ID ${uniqueId}`);
+            if (callback) callback(response);
+            return response;
+          } catch (lastError) {
+            console.error('^1[oxpgsql] ^7All attempts to fix INSERT query failed:', lastError.message);
+          }
+        } else if (error.message.includes('duplicate key value violates unique constraint')) {
+          // Handle duplicate key errors by retrying with a different ID
+          try {
+            // Generate a unique ID in a much higher range to avoid conflicts
+            const uniqueId = Math.floor(50000000 + Math.random() * 49999999);
+            if (convertedQuery.includes('INSERT INTO inventory_items')) {
+              // Extract column list
+              const columnMatch = convertedQuery.match(/\(([^)]+)\)/);
+              if (columnMatch) {
+                const columns = columnMatch[1].trim();
+                const retryQuery = `
+                            INSERT INTO inventory_items 
+                            (id, ${columns}) 
+                            VALUES 
+                            ($1, ${parsedParams.map((_, i) => `$${i + 2}`).join(', ')})
+                            RETURNING id
+                        `;
+                const retryParams = [uniqueId, ...parsedParams];
+                const client = await this.pool.connect();
+                const result = await client.query(retryQuery, retryParams);
+                client.release();
+                const response = {
+                  affectedRows: result.rowCount || 0,
+                  insertId: result.rows[0].id,
+                  warningCount: 0,
+                  changedRows: result.rowCount || 0,
+                  fieldCount: result.fields ? result.fields.length : 0,
+                  serverStatus: 2,
+                  info: '',
+                  executionTime: Date.now() - startTime
+                };
+                console.log(`^2[oxpgsql] ^7Retry after duplicate key with ID ${uniqueId}`);
+                if (callback) callback(response);
+                return response;
+              }
+            }
+          } catch (retryError) {
+            console.error('^1[oxpgsql] ^7Failed to retry after duplicate key:', retryError.message);
+          }
+        }
+        if (callback) callback(false, error.message);
+        return Promise.reject(error);
+      }
+    }
+    async execute(query, parameters = [], callback = null) {
+      if (!this.isReady) {
+        const error = 'Database not ready';
+        if (callback) callback(false, error);
+        return Promise.reject(new Error(error));
+      }
+      const startTime = Date.now();
+      const parsedParams = this.parseParameters(parameters);
+      let convertedQuery = this.convertMySQLToPostgreSQL(query);
+
+      // Only attempt to fix inventory_items INSERT queries
+      if (convertedQuery.includes('INSERT INTO inventory_items') && !convertedQuery.includes('(id,') && !convertedQuery.includes('(id ')) {
+        try {
+          // Extract column list
+          const columnMatch = convertedQuery.match(/\(([^)]+)\)/);
+          if (columnMatch) {
+            const columns = columnMatch[1].trim();
+
+            // Check if this is a multi-row insert
+            const isMultiRow = convertedQuery.includes('), (');
+            if (isMultiRow) {
+              // For multi-row inserts, we need to break it down into individual inserts
+              // This is a simplified approach - parameters are grouped in sets of 7
+              const rowSize = 7; // For inventory_items table
+              const results = [];
+              for (let i = 0; i < parsedParams.length; i += rowSize) {
+                const rowParams = parsedParams.slice(i, i + rowSize);
+                if (rowParams.length === rowSize) {
+                  // Make sure we have a complete row
+                  // Generate a unique ID for this row
+                  const uniqueId = await this.getUniqueId('inventory_items');
+
+                  // Create a query for this specific row
+                  const singleInsertQuery = `
+                                INSERT INTO inventory_items 
+                                (id, name, label, description, inventory_identifier, slot, amount, metadata) 
+                                VALUES 
+                                ($1, $2, $3, $4, $5, $6, $7, $8)
+                                RETURNING id
+                            `;
+
+                  // Add the ID as the first parameter
+                  const rowParamsWithId = [uniqueId, ...rowParams];
+                  const client = await this.pool.connect();
+                  const result = await client.query(singleInsertQuery, rowParamsWithId);
+                  client.release();
+                  results.push({
+                    id: result.rows[0].id,
+                    affectedRows: result.rowCount
+                  });
+                }
+              }
+
+              // Create a combined result
+              const response = {
+                affectedRows: results.reduce((sum, item) => sum + item.affectedRows, 0),
+                insertId: results.length > 0 ? results[0].id : null,
+                warningCount: 0,
+                changedRows: results.reduce((sum, item) => sum + item.affectedRows, 0),
+                fieldCount: 0,
+                serverStatus: 2,
+                info: '',
+                executionTime: Date.now() - startTime
+              };
+              console.log(`^2[oxpgsql] ^7Auto-fixed multi-row INSERT with ${results.length} individual inserts`);
+              if (callback) callback(response);
+              return response;
+            } else {
+              // For single-row inserts
+              // Generate a unique ID
+              const uniqueId = await this.getUniqueId('inventory_items');
+
+              // Create a fixed query with the explicit ID
+              const fixedQuery = `
+                        INSERT INTO inventory_items 
+                        (id, ${columns}) 
+                        VALUES 
+                        ($1, ${parsedParams.map((_, i) => `$${i + 2}`).join(', ')})
+                        RETURNING id
+                    `;
+
+              // Add the ID as the first parameter
+              const paramsWithId = [uniqueId, ...parsedParams];
+              const client = await this.pool.connect();
+              const result = await client.query(fixedQuery, paramsWithId);
+              client.release();
+              const response = {
+                affectedRows: result.rowCount || 0,
+                insertId: result.rows[0].id,
+                warningCount: 0,
+                changedRows: result.rowCount || 0,
+                fieldCount: result.fields ? result.fields.length : 0,
+                serverStatus: 2,
+                info: '',
+                executionTime: Date.now() - startTime
+              };
+              console.log(`^2[oxpgsql] ^7Auto-fixed inventory_items INSERT query with ID ${uniqueId}`);
+              if (callback) callback(response);
+              return response;
+            }
+          }
+        } catch (fixError) {
+          console.error('^1[oxpgsql] ^7Failed to fix INSERT query:', fixError.message);
+          // Continue to try the original query
+        }
+      }
+      try {
+        const client = await this.pool.connect();
+        const result = await client.query(convertedQuery, parsedParams);
+        client.release();
+        const executionTime = Date.now() - startTime;
+        this.queryCount++;
+        if (executionTime > this.slowQueryThreshold) {
+          console.warn(`^3[oxpgsql] ^7Slow query detected (${executionTime}ms):`, convertedQuery.substring(0, 100));
+        }
+        const response = {
+          affectedRows: result.rowCount || 0,
+          insertId: this.getInsertId(result),
+          warningCount: 0,
+          changedRows: result.rowCount || 0,
+          fieldCount: result.fields ? result.fields.length : 0,
+          serverStatus: 2,
+          info: '',
+          executionTime: executionTime
+        };
+        if (callback) callback(response);
+        return response;
+      } catch (error) {
+        console.error('^1[oxpgsql] ^7Execute error:', error.message);
+        console.error('^1[oxpgsql] ^7Query:', convertedQuery);
+
+        // Handle ID constraint violation as a last resort
+        if (error.message.includes('violates not-null constraint') && error.message.includes('column "id"') && convertedQuery.includes('INSERT INTO inventory_items')) {
+          try {
+            // Generate a unique random ID in a higher range to avoid conflicts
+            const uniqueId = Math.floor(10000000 + Math.random() * 89999999);
+
+            // Create a completely new query with explicit column names
+            const lastResortQuery = `
+                    INSERT INTO inventory_items 
+                    (id, name, label, description, inventory_identifier, slot, amount, metadata) 
+                    VALUES 
+                    ($1, $2, $3, $4, $5, $6, $7, $8)
+                    RETURNING id
+                `;
+
+            // Add the ID as the first parameter
+            const lastResortParams = [uniqueId, ...parsedParams];
+            const client = await this.pool.connect();
+            const result = await client.query(lastResortQuery, lastResortParams);
+            client.release();
+            const response = {
+              affectedRows: result.rowCount || 0,
+              insertId: result.rows[0].id,
+              warningCount: 0,
+              changedRows: result.rowCount || 0,
+              fieldCount: result.fields ? result.fields.length : 0,
+              serverStatus: 2,
+              info: '',
+              executionTime: Date.now() - startTime
+            };
+            console.log(`^2[oxpgsql] ^7Last resort fix for inventory_items INSERT with ID ${uniqueId}`);
+            if (callback) callback(response);
+            return response;
+          } catch (lastError) {
+            console.error('^1[oxpgsql] ^7All attempts to fix INSERT query failed:', lastError.message);
+          }
+        } else if (error.message.includes('duplicate key value violates unique constraint')) {
+          // Handle duplicate key errors by retrying with a different ID
+          try {
+            // Generate a unique ID in a much higher range to avoid conflicts
+            const uniqueId = Math.floor(50000000 + Math.random() * 49999999);
+            if (convertedQuery.includes('INSERT INTO inventory_items')) {
+              // Extract column list
+              const columnMatch = convertedQuery.match(/\(([^)]+)\)/);
+              if (columnMatch) {
+                const columns = columnMatch[1].trim();
+                const retryQuery = `
+                            INSERT INTO inventory_items 
+                            (id, ${columns}) 
+                            VALUES 
+                            ($1, ${parsedParams.map((_, i) => `$${i + 2}`).join(', ')})
+                            RETURNING id
+                        `;
+                const retryParams = [uniqueId, ...parsedParams];
+                const client = await this.pool.connect();
+                const result = await client.query(retryQuery, retryParams);
+                client.release();
+                const response = {
+                  affectedRows: result.rowCount || 0,
+                  insertId: result.rows[0].id,
+                  warningCount: 0,
+                  changedRows: result.rowCount || 0,
+                  fieldCount: result.fields ? result.fields.length : 0,
+                  serverStatus: 2,
+                  info: '',
+                  executionTime: Date.now() - startTime
+                };
+                console.log(`^2[oxpgsql] ^7Retry after duplicate key with ID ${uniqueId}`);
+                if (callback) callback(response);
+                return response;
+              }
+            }
+          } catch (retryError) {
+            console.error('^1[oxpgsql] ^7Failed to retry after duplicate key:', retryError.message);
           }
         }
         if (callback) callback(false, error.message);
