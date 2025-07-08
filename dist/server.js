@@ -6314,7 +6314,7 @@
     Pool,
     Client
   } = __webpack_require__(1596);
-  class OxPgSQL {
+  class NeonPgSQL {
     constructor() {
       this.pool = null;
       this.isReady = false;
@@ -6323,33 +6323,52 @@
       this.queryCount = 0;
       this.slowQueryThreshold = GetConvarInt('pgsql_slow_query_warning', 100);
       this.debugMode = GetConvar('pgsql_debug', 'false') === 'true';
-      this.booleanColumns = new Set(); // Cache for known boolean columns
+      this.booleanColumns = new Set();
+      this.tableInfoCache = new Map();
+
+      // NeonDB optimized settings
+      this.queryBatch = [];
+      this.batchingEnabled = GetConvar('pgsql_enable_batching', 'true') === 'true';
+      this.batchMaxSize = GetConvarInt('pgsql_batch_max_size', 10);
+      this.batchTimeout = GetConvarInt('pgsql_batch_timeout', 50);
+      this.batchTimer = null;
+
+      // Connection management
+      this.warmupInterval = null;
+      this.warmupEnabled = GetConvar('pgsql_enable_warmup', 'true') === 'true';
+      this.warmupFrequency = GetConvarInt('pgsql_warmup_frequency', 300000);
+      this.retryConfig = {
+        maxRetries: GetConvarInt('pgsql_max_retries', 5),
+        initialDelay: GetConvarInt('pgsql_retry_delay', 100),
+        maxDelay: GetConvarInt('pgsql_max_retry_delay', 5000)
+      };
+
+      // Metrics
+      this.metrics = {
+        coldStarts: 0,
+        reconnects: 0,
+        lastConnectTime: 0,
+        storageStats: {
+          lastCheck: 0
+        }
+      };
       this.init();
     }
     getConnectionConfig() {
       const connectionString = GetConvar('pgsql_connection_string', '');
-      if (connectionString) {
-        return {
-          connectionString: connectionString,
-          max: GetConvarInt('pgsql_max_connections', 20),
-          min: GetConvarInt('pgsql_min_connections', 5),
-          idleTimeoutMillis: GetConvarInt('pgsql_idle_timeout', 30000),
-          connectionTimeoutMillis: GetConvarInt('pgsql_connection_timeout', 10000),
-          acquireTimeoutMillis: GetConvarInt('pgsql_acquire_timeout', 10000),
-          ssl: GetConvar('pgsql_ssl', 'true') === 'true' ? {
-            rejectUnauthorized: false
-          } : false,
-          statement_timeout: GetConvarInt('pgsql_statement_timeout', 60000),
-          query_timeout: GetConvarInt('pgsql_query_timeout', 60000),
-          application_name: 'FiveM-oxpgsql'
-        };
-      }
-      return {
+      const config = connectionString ? {
+        connectionString
+      } : {
         host: GetConvar('pgsql_host', 'localhost'),
         port: GetConvarInt('pgsql_port', 5432),
         database: GetConvar('pgsql_database', 'fivem'),
         user: GetConvar('pgsql_user', 'postgres'),
-        password: GetConvar('pgsql_password', ''),
+        password: GetConvar('pgsql_password', '')
+      };
+
+      // Common connection options
+      return {
+        ...config,
         max: GetConvarInt('pgsql_max_connections', 20),
         min: GetConvarInt('pgsql_min_connections', 5),
         idleTimeoutMillis: GetConvarInt('pgsql_idle_timeout', 30000),
@@ -6360,63 +6379,241 @@
         } : false,
         statement_timeout: GetConvarInt('pgsql_statement_timeout', 60000),
         query_timeout: GetConvarInt('pgsql_query_timeout', 60000),
-        application_name: 'FiveM-oxpgsql'
+        application_name: 'FiveM-oxpgsql',
+        // NeonDB optimizations
+        keepAlive: true,
+        keepAliveInitialDelayMillis: 10000
       };
     }
     async init() {
       try {
         this.pool = new Pool(this.connectionConfig);
 
-        // Test connection
+        // Setup connection pool event handlers
+        this.pool.on('error', this.handlePoolError.bind(this));
+        this.pool.on('connect', this.handleClientConnect.bind(this));
+
+        // Test connection with retry
+        await this.connectWithRetry();
+
+        // Start background warmup if enabled
+        if (this.warmupEnabled) {
+          this.startWarmupInterval();
+        }
+
+        // Schedule storage monitoring
+        setTimeout(() => this.monitorStorage(), 10000);
+      } catch (error) {
+        console.error('^6NEONDB: ^7Failed to connect to database:', error.message);
+        this.isReady = false;
+        setTimeout(() => this.init(), 5000);
+      }
+    }
+    handlePoolError(err) {
+      console.error('^6NEONDB: ^7Pool error:', err.message);
+      if (err.message.includes('connection terminated') || err.message.includes('connection idle') || err.message.includes('timeout')) {
+        this.metrics.reconnects++;
+        if (this.isReady) {
+          console.log('^6NEONDB: ^7Attempting to reconnect after connection error...');
+          this.isReady = false;
+          this.connectWithRetry();
+        }
+      }
+    }
+    handleClientConnect(client) {
+      if (this.debugMode) {
+        console.log('^6NEONDB: ^7New client connected');
+      }
+
+      // Set session parameters for better performance with NeonDB
+      client.query(`
+            SET statement_timeout = ${this.connectionConfig.statement_timeout};
+            SET idle_in_transaction_session_timeout = ${this.connectionConfig.idleTimeoutMillis};
+        `).catch(err => {
+        console.error('^6NEONDB: ^7Failed to set session parameters:', err.message);
+      });
+    }
+    async connectWithRetry(attempt = 0) {
+      const {
+        maxRetries,
+        initialDelay,
+        maxDelay
+      } = this.retryConfig;
+      const delay = Math.min(initialDelay * Math.pow(2, attempt), maxDelay);
+      try {
+        const startTime = Date.now();
         const client = await this.pool.connect();
         const result = await client.query('SELECT NOW() as server_time, version() as version');
         client.release();
+        const connectTime = Date.now() - startTime;
+        this.metrics.lastConnectTime = connectTime;
+        if (connectTime > 1000) {
+          this.metrics.coldStarts++;
+          console.log(`^6NEONDB: ^7Cold start detected (${connectTime}ms)`);
+        }
         this.isReady = true;
         console.log('^6NEONDB: ^7Connected to PostgreSQL database successfully');
         console.log('^6NEONDB: ^7Server time:', result.rows[0].server_time);
         console.log('^6NEONDB: ^7PostgreSQL version:', result.rows[0].version.split(' ')[0] + ' ' + result.rows[0].version.split(' ')[1]);
         console.log('^6NEONDB: ^7Connection pool initialized with', this.connectionConfig.max, 'max connections');
-
-        // Handle pool events
-        this.pool.on('error', err => {
-          console.error('^6NEONDB: ^7Pool error:', err.message);
-        });
-        this.pool.on('connect', client => {
-          if (this.debugMode) {
-            console.log('^6NEONDB: ^7New client connected');
-          }
-        });
-        this.pool.on('acquire', client => {
-          if (this.debugMode) {
-            console.log('^6NEONDB: ^7Client acquired from pool');
-          }
-        });
-        this.pool.on('remove', client => {
-          if (this.debugMode) {
-            console.log('^6NEONDB: ^7Client removed from pool');
-          }
-        });
       } catch (error) {
-        console.error('^6NEONDB: ^7Failed to connect to database:', error.message);
-        this.isReady = false;
+        if (attempt < maxRetries) {
+          console.log(`^6NEONDB: ^7Connection attempt ${attempt + 1}/${maxRetries + 1} failed: ${error.message}. Retrying in ${delay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          return this.connectWithRetry(attempt + 1);
+        }
+        throw error;
       }
+    }
+    async getClient() {
+      if (!this.isReady) {
+        throw new Error('Database not ready');
+      }
+      try {
+        return await this.pool.connect();
+      } catch (error) {
+        // Handle cold start issues
+        if (error.message.includes('timeout') || error.message.includes('no connections available')) {
+          this.metrics.coldStarts++;
+          console.log('^6NEONDB: ^7Cold start detected, attempting recovery...');
+
+          // Try a direct connection to warm up
+          try {
+            const directClient = new Client(this.connectionConfig);
+            await directClient.connect();
+            await directClient.query('SELECT 1');
+            await directClient.end();
+
+            // Retry getting a pooled client
+            return await this.pool.connect();
+          } catch (warmupError) {
+            console.error('^6NEONDB: ^7Warmup failed:', warmupError.message);
+            throw error; // Rethrow the original error
+          }
+        }
+        throw error;
+      }
+    }
+    startWarmupInterval() {
+      if (this.warmupInterval) {
+        clearInterval(this.warmupInterval);
+      }
+      this.warmupInterval = setInterval(async () => {
+        if (!this.isReady) return;
+        try {
+          const client = await this.pool.connect();
+          await client.query('SELECT 1');
+          client.release();
+          if (this.debugMode) {
+            console.log('^6NEONDB: ^7Warmup query completed');
+          }
+        } catch (error) {
+          console.error('^6NEONDB: ^7Warmup query failed:', error.message);
+        }
+      }, this.warmupFrequency);
+    }
+    async monitorStorage() {
+      if (!this.isReady) {
+        setTimeout(() => this.monitorStorage(), 60000);
+        return;
+      }
+      try {
+        const client = await this.getClient();
+        const result = await client.query(`
+                SELECT
+                    schemaname,
+                    relname as table_name,
+                    pg_size_pretty(pg_total_relation_size(schemaname||'.'||relname)) as size
+                FROM pg_stat_user_tables
+                ORDER BY pg_total_relation_size(schemaname||'.'||relname) DESC
+                LIMIT 5;
+            `);
+        client.release();
+        this.metrics.storageStats = {
+          topTables: result.rows,
+          lastCheck: Date.now()
+        };
+        if (this.debugMode) {
+          console.log('^6NEONDB: ^7Storage stats updated');
+        }
+      } catch (error) {
+        console.error('^6NEONDB: ^7Failed to monitor storage:', error.message);
+      }
+
+      // Schedule next check
+      setTimeout(() => this.monitorStorage(), 3600000); // Check every hour
+    }
+    processBatch() {
+      if (this.queryBatch.length === 0) return;
+      const batch = [...this.queryBatch];
+      this.queryBatch = [];
+      this.batchTimer = null;
+      if (this.debugMode) {
+        console.log(`^6NEONDB: ^7Processing batch of ${batch.length} queries`);
+      }
+      this.getClient().then(async client => {
+        try {
+          await client.query('BEGIN');
+          for (const item of batch) {
+            try {
+              const result = await client.query(item.query, item.params);
+              item.resolve({
+                success: true,
+                result: result
+              });
+            } catch (err) {
+              item.resolve({
+                success: false,
+                error: err
+              });
+            }
+          }
+          await client.query('COMMIT');
+        } catch (error) {
+          await client.query('ROLLBACK').catch(() => { });
+          for (const item of batch) {
+            if (!item.processed) {
+              item.resolve({
+                success: false,
+                error: error
+              });
+            }
+          }
+        } finally {
+          client.release();
+        }
+      }).catch(error => {
+        for (const item of batch) {
+          item.resolve({
+            success: false,
+            error: error
+          });
+        }
+      });
+    }
+    addToBatch(query, params) {
+      return new Promise(resolve => {
+        this.queryBatch.push({
+          query,
+          params,
+          resolve,
+          processed: false
+        });
+        if (!this.batchTimer) {
+          this.batchTimer = setTimeout(() => this.processBatch(), this.batchTimeout);
+        }
+        if (this.queryBatch.length >= this.batchMaxSize) {
+          clearTimeout(this.batchTimer);
+          this.batchTimer = null;
+          this.processBatch();
+        }
+      });
     }
     parseParameters(parameters) {
       if (!parameters) return [];
-      if (Array.isArray(parameters)) {
-        return parameters; // Don't auto-convert parameters
-      }
-      if (typeof parameters === 'object') {
-        return Object.values(parameters);
-      }
+      if (Array.isArray(parameters)) return parameters;
+      if (typeof parameters === 'object') return Object.values(parameters);
       return [parameters];
-    }
-
-    // Common boolean column names that are likely to be boolean fields
-    getBooleanColumnPatterns() {
-      return ['enabled', 'enable', 'disabled', 'disable', 'active', 'inactive', 'is_active', 'is_enabled', 'visible', 'hidden', 'is_visible', 'is_hidden', 'online', 'offline', 'is_online', 'banned', 'is_banned', 'locked', 'is_locked', 'verified', 'is_verified', 'approved', 'is_approved', 'deleted', 'is_deleted', 'archived', 'is_archived', 'public', 'private', 'is_public', 'is_private', 'for_sale', 'available', 'is_available', 'completed', 'is_completed', 'finished', 'is_finished',
-        // Add more boolean column patterns here as needed
-        'status', 'is_status', 'valid', 'is_valid', 'paid', 'is_paid', 'processed', 'is_processed', 'confirmed', 'is_confirmed', 'flagged', 'is_flagged', 'subscribed', 'is_subscribed', 'premium', 'is_premium'];
     }
     convertMySQLToPostgreSQL(query) {
       let convertedQuery = query;
@@ -6425,7 +6622,7 @@
       // Replace ? with $1, $2, etc.
       convertedQuery = convertedQuery.replace(/\?/g, () => `$${paramIndex++}`);
 
-      // Convert MySQL specific functions to PostgreSQL
+      // Basic MySQL to PostgreSQL conversions
       convertedQuery = convertedQuery.replace(/NOW\(\)/gi, 'NOW()');
       convertedQuery = convertedQuery.replace(/UNIX_TIMESTAMP\(\)/gi, 'EXTRACT(EPOCH FROM NOW())');
       convertedQuery = convertedQuery.replace(/UNIX_TIMESTAMP\(([^)]+)\)/gi, 'EXTRACT(EPOCH FROM $1)');
@@ -6437,102 +6634,63 @@
       convertedQuery = convertedQuery.replace(/BIGINT\s+UNSIGNED/gi, 'BIGINT');
       convertedQuery = convertedQuery.replace(/TINYINT\(1\)/gi, 'BOOLEAN');
       convertedQuery = convertedQuery.replace(/DATETIME/gi, 'TIMESTAMP');
-      convertedQuery = convertedQuery.replace(/TEXT/gi, 'TEXT');
 
-      // Get boolean column patterns
-      const booleanColumns = this.getBooleanColumnPatterns();
-      const booleanPattern = `\\b(${booleanColumns.join('|')})\\b`;
+      // Handle boolean columns
+      const booleanColumns = ['enabled', 'active', 'visible', 'online', 'banned', 'locked', 'verified', 'deleted', 'archived', 'public', 'available', 'completed'].join('|');
+      const boolPattern = `\\b(${booleanColumns})\\b`;
 
-      // CASE 1: Handle "column = 1" or "column = 0" by converting to "column::integer = 1/0"
-      // This handles integer to boolean comparisons
-      const equalsOneRegex = new RegExp(`${booleanPattern}\\s*=\\s*1\\b(?!\\d)`, 'gi');
-      const equalsZeroRegex = new RegExp(`${booleanPattern}\\s*=\\s*0\\b(?!\\d)`, 'gi');
-      const notEqualsOneRegex = new RegExp(`${booleanPattern}\\s*(?:!=|<>)\\s*1\\b(?!\\d)`, 'gi');
-      const notEqualsZeroRegex = new RegExp(`${booleanPattern}\\s*(?:!=|<>)\\s*0\\b(?!\\d)`, 'gi');
-      convertedQuery = convertedQuery.replace(equalsOneRegex, '$1::integer = 1');
-      convertedQuery = convertedQuery.replace(equalsZeroRegex, '$1::integer = 0');
-      convertedQuery = convertedQuery.replace(notEqualsOneRegex, '$1::integer != 1');
-      convertedQuery = convertedQuery.replace(notEqualsZeroRegex, '$1::integer != 0');
-
-      // CASE 2: Handle "column = true" or "column = false" by converting to "(column::integer)::boolean = true/false"
-      // This handles boolean to integer comparisons
-      const equalsTrueRegex = new RegExp(`${booleanPattern}\\s*=\\s*true\\b`, 'gi');
-      const equalsFalseRegex = new RegExp(`${booleanPattern}\\s*=\\s*false\\b`, 'gi');
-      const notEqualsTrueRegex = new RegExp(`${booleanPattern}\\s*(?:!=|<>)\\s*true\\b`, 'gi');
-      const notEqualsFalseRegex = new RegExp(`${booleanPattern}\\s*(?:!=|<>)\\s*false\\b`, 'gi');
-      convertedQuery = convertedQuery.replace(equalsTrueRegex, '$1::integer = 1');
-      convertedQuery = convertedQuery.replace(equalsFalseRegex, '$1::integer = 0');
-      convertedQuery = convertedQuery.replace(notEqualsTrueRegex, '$1::integer != 1');
-      convertedQuery = convertedQuery.replace(notEqualsFalseRegex, '$1::integer != 0');
-
-      // Handle cases where true/false literals are used in other contexts
-      // For example, in INSERT or UPDATE statements
-      convertedQuery = convertedQuery.replace(/\b(VALUES\s*\([^)]*?),\s*true\b/gi, '$1, 1');
-      convertedQuery = convertedQuery.replace(/\b(VALUES\s*\([^)]*?),\s*false\b/gi, '$1, 0');
-      convertedQuery = convertedQuery.replace(/\bSET\s+([^=]+)\s*=\s*true\b/gi, 'SET $1 = 1');
-      convertedQuery = convertedQuery.replace(/\bSET\s+([^=]+)\s*=\s*false\b/gi, 'SET $1 = 0');
+      // Convert boolean comparisons
+      convertedQuery = convertedQuery.replace(new RegExp(`${boolPattern}\\s*=\\s*1\\b`, 'gi'), '$1::integer = 1');
+      convertedQuery = convertedQuery.replace(new RegExp(`${boolPattern}\\s*=\\s*0\\b`, 'gi'), '$1::integer = 0');
+      convertedQuery = convertedQuery.replace(new RegExp(`${boolPattern}\\s*=\\s*true\\b`, 'gi'), '$1::integer = 1');
+      convertedQuery = convertedQuery.replace(new RegExp(`${boolPattern}\\s*=\\s*false\\b`, 'gi'), '$1::integer = 0');
       return convertedQuery;
     }
     async getTableInfo(tableName) {
-      if (!this.tableInfoCache) {
-        this.tableInfoCache = new Map();
-      }
-
-      // Check if we have cached info for this table
       if (this.tableInfoCache.has(tableName)) {
         return this.tableInfoCache.get(tableName);
       }
       try {
-        // Query to get primary key column and if it's a serial/identity column
-        const query = `
-            SELECT 
-                a.attname as column_name,
-                format_type(a.atttypid, a.atttypmod) as data_type,
-                pg_get_expr(d.adbin, d.adrelid) as default_value,
-                a.attnotnull as not_null,
-                (SELECT EXISTS (
-                    SELECT 1 FROM pg_constraint c 
-                    WHERE c.conrelid = a.attrelid 
-                    AND c.conkey[1] = a.attnum 
-                    AND c.contype = 'p'
-                )) as is_primary_key
-            FROM pg_attribute a
-            LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum
-            WHERE a.attrelid = $1::regclass
-            AND a.attnum > 0
-            AND NOT a.attisdropped
-            ORDER BY a.attnum
-        `;
-        const client = await this.pool.connect();
-        const result = await client.query(query, [tableName]);
+        const client = await this.getClient();
+        const result = await client.query(`
+                SELECT 
+                    a.attname as column_name,
+                    format_type(a.atttypid, a.atttypmod) as data_type,
+                    pg_get_expr(d.adbin, d.adrelid) as default_value,
+                    a.attnotnull as not_null,
+                    (SELECT EXISTS (
+                        SELECT 1 FROM pg_constraint c 
+                        WHERE c.conrelid = a.attrelid 
+                        AND c.conkey[1] = a.attnum 
+                        AND c.contype = 'p'
+                    )) as is_primary_key
+                FROM pg_attribute a
+                LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+                WHERE a.attrelid = $1::regclass
+                AND a.attnum > 0
+                AND NOT a.attisdropped
+                ORDER BY a.attnum
+            `, [tableName]);
         client.release();
-        const columns = {};
-        let primaryKey = null;
-        let hasIdentityColumn = false;
+        const tableInfo = {
+          columns: {},
+          primaryKey: null,
+          hasIdentityColumn: false
+        };
         for (const row of result.rows) {
-          columns[row.column_name] = {
+          tableInfo.columns[row.column_name] = {
             dataType: row.data_type,
             notNull: row.not_null,
             isPrimaryKey: row.is_primary_key,
             defaultValue: row.default_value
           };
-
-          // Check if this is a primary key with a default value (likely a serial/identity)
-          if (row.is_primary_key && row.default_value) {
-            primaryKey = row.column_name;
-            // Check if default value contains nextval or similar sequence function
-            if (row.default_value.includes('nextval') || row.default_value.includes('identity')) {
-              hasIdentityColumn = true;
+          if (row.is_primary_key) {
+            tableInfo.primaryKey = row.column_name;
+            if (row.default_value && (row.default_value.includes('nextval') || row.default_value.includes('identity'))) {
+              tableInfo.hasIdentityColumn = true;
             }
           }
         }
-        const tableInfo = {
-          columns,
-          primaryKey,
-          hasIdentityColumn
-        };
-
-        // Cache the result
         this.tableInfoCache.set(tableName, tableInfo);
         return tableInfo;
       } catch (error) {
@@ -6544,39 +6702,110 @@
         };
       }
     }
-    async findSequenceForTable(tableName) {
+    async getUniqueId(tableName) {
+      const client = await this.getClient();
       try {
-        // Query to find sequences associated with a table's column
-        const query = `
-            SELECT pg_get_serial_sequence($1, 'id') AS sequence_name;
-        `;
-        const client = await this.pool.connect();
-        const result = await client.query(query, [tableName]);
+        const result = await client.query(`SELECT COALESCE(MAX(id), 0) + 1 + floor(random() * 10) as next_id FROM ${tableName}`);
+        return result.rows[0].next_id;
+      } finally {
         client.release();
-        if (result.rows && result.rows.length > 0 && result.rows[0].sequence_name) {
-          return result.rows[0].sequence_name;
-        }
-
-        // If no sequence found, try a more general approach to find any sequence
-        const fallbackQuery = `
-            SELECT ns.nspname || '.' || seq.relname AS sequence_name
-            FROM pg_class seq
-            JOIN pg_namespace ns ON seq.relnamespace = ns.oid
-            WHERE seq.relkind = 'S'
-            AND seq.relname LIKE $1
-            LIMIT 1;
-        `;
-        const client2 = await this.pool.connect();
-        const result2 = await client2.query(fallbackQuery, [`%${tableName}%id%`]);
-        client2.release();
-        if (result2.rows && result2.rows.length > 0 && result2.rows[0].sequence_name) {
-          return result2.rows[0].sequence_name;
-        }
-        return null;
-      } catch (error) {
-        console.error(`^6NEONDB: ^7Failed to find sequence for table ${tableName}:`, error.message);
-        return null;
       }
+    }
+    getInsertId(result) {
+      if (result.rows && result.rows.length > 0) {
+        const row = result.rows[0];
+        if (row.id !== undefined) return row.id;
+
+        // If we can't find a specific ID column, return the first column's value
+        const firstKey = Object.keys(row)[0];
+        return row[firstKey];
+      }
+      return null;
+    }
+    async handleQueryError(error, query, params, startTime) {
+      // Handle NOT NULL constraint violations for INSERT queries
+      if (error.message.includes('violates not-null constraint') && query.toLowerCase().includes('insert into')) {
+        // Extract table name from query
+        const tableMatch = query.match(/insert\s+into\s+([^\s(]+)/i);
+        if (!tableMatch) return null;
+        const tableName = tableMatch[1].replace(/["'`]/g, '');
+
+        // Get table info to find primary key
+        const tableInfo = await this.getTableInfo(tableName);
+        if (!tableInfo.primaryKey) return null;
+
+        // Extract column list from query
+        const columnMatch = query.match(/\(([^)]+)\)/);
+        if (!columnMatch) return null;
+        const columns = columnMatch[1].trim();
+
+        // Check if the primary key is missing from the column list
+        if (!columns.toLowerCase().includes(tableInfo.primaryKey.toLowerCase())) {
+          try {
+            // Generate a unique ID
+            const uniqueId = await this.getUniqueId(tableName);
+
+            // Create fixed query with ID
+            const fixedQuery = `
+                        INSERT INTO ${tableName} 
+                        (${tableInfo.primaryKey}, ${columns}) 
+                        VALUES 
+                        ($1, ${params.map((_, i) => `$${i + 2}`).join(', ')})
+                        RETURNING ${tableInfo.primaryKey}
+                    `;
+            const client = await this.getClient();
+            const result = await client.query(fixedQuery, [uniqueId, ...params]);
+            client.release();
+            return {
+              affectedRows: result.rowCount || 0,
+              insertId: result.rows[0][tableInfo.primaryKey],
+              warningCount: 0,
+              changedRows: result.rowCount || 0,
+              fieldCount: result.fields ? result.fields.length : 0,
+              serverStatus: 2,
+              info: '',
+              executionTime: Date.now() - startTime
+            };
+          } catch (fixError) {
+            console.error('^1[oxpgsql] ^7Failed to fix INSERT query:', fixError.message);
+          }
+        }
+      }
+
+      // Handle duplicate key violations
+      if (error.message.includes('duplicate key value violates unique constraint')) {
+        const tableMatch = query.match(/insert\s+into\s+([^\s(]+)/i);
+        if (tableMatch) {
+          const tableName = tableMatch[1].replace(/["'`]/g, '');
+          const tableInfo = await this.getTableInfo(tableName);
+          if (tableInfo.primaryKey) {
+            try {
+              // Generate a new unique ID
+              const uniqueId = await this.getUniqueId(tableName);
+
+              // Modify the first parameter (assuming it's the ID)
+              const newParams = [...params];
+              newParams[0] = uniqueId;
+              const client = await this.getClient();
+              const result = await client.query(query, newParams);
+              client.release();
+              return {
+                affectedRows: result.rowCount || 0,
+                insertId: this.getInsertId(result),
+                warningCount: 0,
+                changedRows: result.rowCount || 0,
+                fieldCount: result.fields ? result.fields.length : 0,
+                serverStatus: 2,
+                info: '',
+                executionTime: Date.now() - startTime
+              };
+            } catch (retryError) {
+              console.error('^1[oxpgsql] ^7Failed to retry after duplicate key:', retryError.message);
+            }
+          }
+        }
+      }
+      return null;
     }
     async execute(query, parameters = [], callback = null) {
       if (!this.isReady) {
@@ -6586,106 +6815,38 @@
       }
       const startTime = Date.now();
       const parsedParams = this.parseParameters(parameters);
-      let convertedQuery = this.convertMySQLToPostgreSQL(query);
+      const convertedQuery = this.convertMySQLToPostgreSQL(query);
 
-      // Only attempt to fix inventory_items INSERT queries
-      if (convertedQuery.includes('INSERT INTO inventory_items') && !convertedQuery.includes('(id,') && !convertedQuery.includes('(id ')) {
+      // Use batching for write operations if enabled
+      if (this.batchingEnabled && (query.toLowerCase().startsWith('insert') || query.toLowerCase().startsWith('update') || query.toLowerCase().startsWith('delete'))) {
         try {
-          // Extract column list
-          const columnMatch = convertedQuery.match(/\(([^)]+)\)/);
-          if (columnMatch) {
-            const columns = columnMatch[1].trim();
-
-            // Check if this is a multi-row insert
-            const isMultiRow = convertedQuery.includes('), (');
-            if (isMultiRow) {
-              // For multi-row inserts, we need to break it down into individual inserts
-              // This is a simplified approach - parameters are grouped in sets of 7
-              const rowSize = 7; // For inventory_items table
-              const results = [];
-              for (let i = 0; i < parsedParams.length; i += rowSize) {
-                const rowParams = parsedParams.slice(i, i + rowSize);
-                if (rowParams.length === rowSize) {
-                  // Make sure we have a complete row
-                  // Generate a unique ID for this row
-                  const uniqueId = await this.getUniqueId('inventory_items');
-
-                  // Create a query for this specific row
-                  const singleInsertQuery = `
-                                INSERT INTO inventory_items 
-                                (id, name, label, description, inventory_identifier, slot, amount, metadata) 
-                                VALUES 
-                                ($1, $2, $3, $4, $5, $6, $7, $8)
-                                RETURNING id
-                            `;
-
-                  // Add the ID as the first parameter
-                  const rowParamsWithId = [uniqueId, ...rowParams];
-                  const client = await this.pool.connect();
-                  const result = await client.query(singleInsertQuery, rowParamsWithId);
-                  client.release();
-                  results.push({
-                    id: result.rows[0].id,
-                    affectedRows: result.rowCount
-                  });
-                }
-              }
-
-              // Create a combined result
-              const response = {
-                affectedRows: results.reduce((sum, item) => sum + item.affectedRows, 0),
-                insertId: results.length > 0 ? results[0].id : null,
-                warningCount: 0,
-                changedRows: results.reduce((sum, item) => sum + item.affectedRows, 0),
-                fieldCount: 0,
-                serverStatus: 2,
-                info: '',
-                executionTime: Date.now() - startTime
-              };
-              console.log(`^2[oxpgsql] ^7Auto-fixed multi-row INSERT with ${results.length} individual inserts`);
-              if (callback) callback(response);
-              return response;
-            } else {
-              // For single-row inserts
-              // Generate a unique ID
-              const uniqueId = await this.getUniqueId('inventory_items');
-
-              // Create a fixed query with the explicit ID
-              const fixedQuery = `
-                        INSERT INTO inventory_items 
-                        (id, ${columns}) 
-                        VALUES 
-                        ($1, ${parsedParams.map((_, i) => `$${i + 2}`).join(', ')})
-                        RETURNING id
-                    `;
-
-              // Add the ID as the first parameter
-              const paramsWithId = [uniqueId, ...parsedParams];
-              const client = await this.pool.connect();
-              const result = await client.query(fixedQuery, paramsWithId);
-              client.release();
-              const response = {
-                affectedRows: result.rowCount || 0,
-                insertId: result.rows[0].id,
-                warningCount: 0,
-                changedRows: result.rowCount || 0,
-                fieldCount: result.fields ? result.fields.length : 0,
-                serverStatus: 2,
-                info: '',
-                executionTime: Date.now() - startTime
-              };
-              console.log(`^2[oxpgsql] ^7Auto-fixed inventory_items INSERT query with ID ${uniqueId}`);
-              if (callback) callback(response);
-              return response;
-            }
-          }
-        } catch (fixError) {
-          console.error('^1[oxpgsql] ^7Failed to fix INSERT query:', fixError.message);
-          // Continue to try the original query
+          const {
+            success,
+            result,
+            error
+          } = await this.addToBatch(convertedQuery, parsedParams);
+          if (!success) throw error;
+          const response = {
+            affectedRows: result.rowCount || 0,
+            insertId: this.getInsertId(result),
+            warningCount: 0,
+            changedRows: result.rowCount || 0,
+            fieldCount: result.fields ? result.fields.length : 0,
+            serverStatus: 2,
+            info: '',
+            executionTime: Date.now() - startTime
+          };
+          if (callback) callback(response);
+          return response;
+        } catch (error) {
+          if (callback) callback(false, error.message);
+          return Promise.reject(error);
         }
       }
+
+      // Handle direct execution
       try {
-        const client = await this.pool.connect();
+        const client = await this.getClient();
         const result = await client.query(convertedQuery, parsedParams);
         client.release();
         const executionTime = Date.now() - startTime;
@@ -6707,374 +6868,27 @@
         return response;
       } catch (error) {
         console.error('^1[oxpgsql] ^7Execute error:', error.message);
-        console.error('^1[oxpgsql] ^7Query:', convertedQuery);
 
-        // Handle ID constraint violation as a last resort
-        if (error.message.includes('violates not-null constraint') && error.message.includes('column "id"') && convertedQuery.includes('INSERT INTO inventory_items')) {
-          try {
-            // Generate a unique random ID in a higher range to avoid conflicts
-            const uniqueId = Math.floor(10000000 + Math.random() * 89999999);
-
-            // Create a completely new query with explicit column names
-            const lastResortQuery = `
-                    INSERT INTO inventory_items 
-                    (id, name, label, description, inventory_identifier, slot, amount, metadata) 
-                    VALUES 
-                    ($1, $2, $3, $4, $5, $6, $7, $8)
-                    RETURNING id
-                `;
-
-            // Add the ID as the first parameter
-            const lastResortParams = [uniqueId, ...parsedParams];
-            const client = await this.pool.connect();
-            const result = await client.query(lastResortQuery, lastResortParams);
-            client.release();
-            const response = {
-              affectedRows: result.rowCount || 0,
-              insertId: result.rows[0].id,
-              warningCount: 0,
-              changedRows: result.rowCount || 0,
-              fieldCount: result.fields ? result.fields.length : 0,
-              serverStatus: 2,
-              info: '',
-              executionTime: Date.now() - startTime
-            };
-            console.log(`^2[oxpgsql] ^7Last resort fix for inventory_items INSERT with ID ${uniqueId}`);
-            if (callback) callback(response);
-            return response;
-          } catch (lastError) {
-            console.error('^1[oxpgsql] ^7All attempts to fix INSERT query failed:', lastError.message);
-          }
-        } else if (error.message.includes('duplicate key value violates unique constraint')) {
-          // Handle duplicate key errors by retrying with a different ID
-          try {
-            // Generate a unique ID in a much higher range to avoid conflicts
-            const uniqueId = Math.floor(50000000 + Math.random() * 49999999);
-            if (convertedQuery.includes('INSERT INTO inventory_items')) {
-              // Extract column list
-              const columnMatch = convertedQuery.match(/\(([^)]+)\)/);
-              if (columnMatch) {
-                const columns = columnMatch[1].trim();
-                const retryQuery = `
-                            INSERT INTO inventory_items 
-                            (id, ${columns}) 
-                            VALUES 
-                            ($1, ${parsedParams.map((_, i) => `$${i + 2}`).join(', ')})
-                            RETURNING id
-                        `;
-                const retryParams = [uniqueId, ...parsedParams];
-                const client = await this.pool.connect();
-                const result = await client.query(retryQuery, retryParams);
-                client.release();
-                const response = {
-                  affectedRows: result.rowCount || 0,
-                  insertId: result.rows[0].id,
-                  warningCount: 0,
-                  changedRows: result.rowCount || 0,
-                  fieldCount: result.fields ? result.fields.length : 0,
-                  serverStatus: 2,
-                  info: '',
-                  executionTime: Date.now() - startTime
-                };
-                console.log(`^2[oxpgsql] ^7Retry after duplicate key with ID ${uniqueId}`);
-                if (callback) callback(response);
-                return response;
-              }
-            }
-          } catch (retryError) {
-            console.error('^1[oxpgsql] ^7Failed to retry after duplicate key:', retryError.message);
-          }
+        // Try to handle the error generically
+        const fixedResponse = await this.handleQueryError(error, convertedQuery, parsedParams, startTime);
+        if (fixedResponse) {
+          if (callback) callback(fixedResponse);
+          return fixedResponse;
         }
-        if (callback) callback(false, error.message);
-        return Promise.reject(error);
-      }
-    }
-    async getUniqueId(tableName, retryCount = 0) {
-      if (retryCount > 10) {
-        throw new Error(`Failed to generate unique ID for ${tableName} after 10 attempts`);
-      }
-      try {
-        // Get the current max ID and add a random offset to avoid collisions
-        const client = await this.pool.connect();
-        const result = await client.query(`SELECT COALESCE(MAX(id), 0) as max_id FROM ${tableName}`);
-        client.release();
-        const maxId = parseInt(result.rows[0].max_id);
-        const randomOffset = Math.floor(Math.random() * 100) + 1; // Random number between 1-100
-        const newId = maxId + randomOffset;
-
-        // Check if this ID already exists
-        const checkClient = await this.pool.connect();
-        const checkResult = await checkClient.query(`SELECT 1 FROM ${tableName} WHERE id = $1 LIMIT 1`, [newId]);
-        checkClient.release();
-        if (checkResult.rows.length > 0) {
-          // ID already exists, try again with a larger offset
-          console.log(`^3[oxpgsql] ^7ID ${newId} already exists in ${tableName}, retrying...`);
-          return this.getUniqueId(tableName, retryCount + 1);
-        }
-        return newId;
-      } catch (error) {
-        console.error(`^1[oxpgsql] ^7Error generating unique ID:`, error.message);
-
-        // Fallback to a large random number if all else fails
-        const fallbackId = Math.floor(1000000 + Math.random() * 8999999);
-        console.log(`^3[oxpgsql] ^7Using fallback random ID: ${fallbackId}`);
-        return fallbackId;
-      }
-    }
-    async execute(query, parameters = [], callback = null) {
-      if (!this.isReady) {
-        const error = 'Database not ready';
-        if (callback) callback(false, error);
-        return Promise.reject(new Error(error));
-      }
-      const startTime = Date.now();
-      const parsedParams = this.parseParameters(parameters);
-      let convertedQuery = this.convertMySQLToPostgreSQL(query);
-
-      // Only attempt to fix inventory_items INSERT queries
-      if (convertedQuery.includes('INSERT INTO inventory_items') && !convertedQuery.includes('(id,') && !convertedQuery.includes('(id ')) {
-        try {
-          // Extract column list
-          const columnMatch = convertedQuery.match(/\(([^)]+)\)/);
-          if (columnMatch) {
-            const columns = columnMatch[1].trim();
-
-            // Check if this is a multi-row insert
-            const isMultiRow = convertedQuery.includes('), (');
-            if (isMultiRow) {
-              // For multi-row inserts, we need to break it down into individual inserts
-              // This is a simplified approach - parameters are grouped in sets of 7
-              const rowSize = 7; // For inventory_items table
-              const results = [];
-              for (let i = 0; i < parsedParams.length; i += rowSize) {
-                const rowParams = parsedParams.slice(i, i + rowSize);
-                if (rowParams.length === rowSize) {
-                  // Make sure we have a complete row
-                  // Generate a unique ID for this row
-                  const uniqueId = await this.getUniqueId('inventory_items');
-
-                  // Create a query for this specific row
-                  const singleInsertQuery = `
-                                INSERT INTO inventory_items 
-                                (id, name, label, description, inventory_identifier, slot, amount, metadata) 
-                                VALUES 
-                                ($1, $2, $3, $4, $5, $6, $7, $8)
-                                RETURNING id
-                            `;
-
-                  // Add the ID as the first parameter
-                  const rowParamsWithId = [uniqueId, ...rowParams];
-                  const client = await this.pool.connect();
-                  const result = await client.query(singleInsertQuery, rowParamsWithId);
-                  client.release();
-                  results.push({
-                    id: result.rows[0].id,
-                    affectedRows: result.rowCount
-                  });
-                }
-              }
-
-              // Create a combined result
-              const response = {
-                affectedRows: results.reduce((sum, item) => sum + item.affectedRows, 0),
-                insertId: results.length > 0 ? results[0].id : null,
-                warningCount: 0,
-                changedRows: results.reduce((sum, item) => sum + item.affectedRows, 0),
-                fieldCount: 0,
-                serverStatus: 2,
-                info: '',
-                executionTime: Date.now() - startTime
-              };
-              console.log(`^2[oxpgsql] ^7Auto-fixed multi-row INSERT with ${results.length} individual inserts`);
-              if (callback) callback(response);
-              return response;
-            } else {
-              // For single-row inserts
-              // Generate a unique ID
-              const uniqueId = await this.getUniqueId('inventory_items');
-
-              // Create a fixed query with the explicit ID
-              const fixedQuery = `
-                        INSERT INTO inventory_items 
-                        (id, ${columns}) 
-                        VALUES 
-                        ($1, ${parsedParams.map((_, i) => `$${i + 2}`).join(', ')})
-                        RETURNING id
-                    `;
-
-              // Add the ID as the first parameter
-              const paramsWithId = [uniqueId, ...parsedParams];
-              const client = await this.pool.connect();
-              const result = await client.query(fixedQuery, paramsWithId);
-              client.release();
-              const response = {
-                affectedRows: result.rowCount || 0,
-                insertId: result.rows[0].id,
-                warningCount: 0,
-                changedRows: result.rowCount || 0,
-                fieldCount: result.fields ? result.fields.length : 0,
-                serverStatus: 2,
-                info: '',
-                executionTime: Date.now() - startTime
-              };
-              console.log(`^2[oxpgsql] ^7Auto-fixed inventory_items INSERT query with ID ${uniqueId}`);
-              if (callback) callback(response);
-              return response;
-            }
-          }
-        } catch (fixError) {
-          console.error('^1[oxpgsql] ^7Failed to fix INSERT query:', fixError.message);
-          // Continue to try the original query
-        }
-      }
-      try {
-        const client = await this.pool.connect();
-        const result = await client.query(convertedQuery, parsedParams);
-        client.release();
-        const executionTime = Date.now() - startTime;
-        this.queryCount++;
-        if (executionTime > this.slowQueryThreshold) {
-          console.warn(`^3[oxpgsql] ^7Slow query detected (${executionTime}ms):`, convertedQuery.substring(0, 100));
-        }
-        const response = {
-          affectedRows: result.rowCount || 0,
-          insertId: this.getInsertId(result),
-          warningCount: 0,
-          changedRows: result.rowCount || 0,
-          fieldCount: result.fields ? result.fields.length : 0,
-          serverStatus: 2,
-          info: '',
-          executionTime: executionTime
-        };
-        if (callback) callback(response);
-        return response;
-      } catch (error) {
-        console.error('^1[oxpgsql] ^7Execute error:', error.message);
-        console.error('^1[oxpgsql] ^7Query:', convertedQuery);
-
-        // Handle ID constraint violation as a last resort
-        if (error.message.includes('violates not-null constraint') && error.message.includes('column "id"') && convertedQuery.includes('INSERT INTO inventory_items')) {
-          try {
-            // Generate a unique random ID in a higher range to avoid conflicts
-            const uniqueId = Math.floor(10000000 + Math.random() * 89999999);
-
-            // Create a completely new query with explicit column names
-            const lastResortQuery = `
-                    INSERT INTO inventory_items 
-                    (id, name, label, description, inventory_identifier, slot, amount, metadata) 
-                    VALUES 
-                    ($1, $2, $3, $4, $5, $6, $7, $8)
-                    RETURNING id
-                `;
-
-            // Add the ID as the first parameter
-            const lastResortParams = [uniqueId, ...parsedParams];
-            const client = await this.pool.connect();
-            const result = await client.query(lastResortQuery, lastResortParams);
-            client.release();
-            const response = {
-              affectedRows: result.rowCount || 0,
-              insertId: result.rows[0].id,
-              warningCount: 0,
-              changedRows: result.rowCount || 0,
-              fieldCount: result.fields ? result.fields.length : 0,
-              serverStatus: 2,
-              info: '',
-              executionTime: Date.now() - startTime
-            };
-            console.log(`^2[oxpgsql] ^7Last resort fix for inventory_items INSERT with ID ${uniqueId}`);
-            if (callback) callback(response);
-            return response;
-          } catch (lastError) {
-            console.error('^1[oxpgsql] ^7All attempts to fix INSERT query failed:', lastError.message);
-          }
-        } else if (error.message.includes('duplicate key value violates unique constraint')) {
-          // Handle duplicate key errors by retrying with a different ID
-          try {
-            // Generate a unique ID in a much higher range to avoid conflicts
-            const uniqueId = Math.floor(50000000 + Math.random() * 49999999);
-            if (convertedQuery.includes('INSERT INTO inventory_items')) {
-              // Extract column list
-              const columnMatch = convertedQuery.match(/\(([^)]+)\)/);
-              if (columnMatch) {
-                const columns = columnMatch[1].trim();
-                const retryQuery = `
-                            INSERT INTO inventory_items 
-                            (id, ${columns}) 
-                            VALUES 
-                            ($1, ${parsedParams.map((_, i) => `$${i + 2}`).join(', ')})
-                            RETURNING id
-                        `;
-                const retryParams = [uniqueId, ...parsedParams];
-                const client = await this.pool.connect();
-                const result = await client.query(retryQuery, retryParams);
-                client.release();
-                const response = {
-                  affectedRows: result.rowCount || 0,
-                  insertId: result.rows[0].id,
-                  warningCount: 0,
-                  changedRows: result.rowCount || 0,
-                  fieldCount: result.fields ? result.fields.length : 0,
-                  serverStatus: 2,
-                  info: '',
-                  executionTime: Date.now() - startTime
-                };
-                console.log(`^2[oxpgsql] ^7Retry after duplicate key with ID ${uniqueId}`);
-                if (callback) callback(response);
-                return response;
-              }
-            }
-          } catch (retryError) {
-            console.error('^1[oxpgsql] ^7Failed to retry after duplicate key:', retryError.message);
-          }
-        }
-        if (callback) callback(false, error.message);
-        return Promise.reject(error);
-      }
-    }
-    async rawExecute(query, parameters = [], callback = null) {
-      if (!this.isReady) {
-        const error = 'Database not ready';
-        if (callback) callback(false, error);
-        return Promise.reject(new Error(error));
-      }
-      const startTime = Date.now();
-      const parsedParams = this.parseParameters(parameters);
-      try {
-        const client = await this.pool.connect();
-        const result = await client.query(query, parsedParams);
-        client.release();
-        const executionTime = Date.now() - startTime;
-        this.queryCount++;
-        const response = {
-          affectedRows: result.rowCount || 0,
-          insertId: this.getInsertId(result),
-          warningCount: 0,
-          changedRows: result.rowCount || 0,
-          fieldCount: result.fields ? result.fields.length : 0,
-          serverStatus: 2,
-          info: '',
-          executionTime: executionTime
-        };
-        if (callback) callback(response);
-        return response;
-      } catch (error) {
-        console.error('^6NEONDB: ^7Raw execute error:', error.message);
         if (callback) callback(false, error.message);
         return Promise.reject(error);
       }
     }
     async query(query, parameters = [], callback = null) {
       if (!this.isReady) {
-        const error = 'Database not ready';
         if (callback) callback([]);
-        return Promise.reject(new Error(error));
+        return Promise.reject(new Error('Database not ready'));
       }
       const startTime = Date.now();
       const parsedParams = this.parseParameters(parameters);
       const convertedQuery = this.convertMySQLToPostgreSQL(query);
       try {
-        const client = await this.pool.connect();
+        const client = await this.getClient();
         const result = await client.query(convertedQuery, parsedParams);
         client.release();
         const executionTime = Date.now() - startTime;
@@ -7082,39 +6896,11 @@
         if (executionTime > this.slowQueryThreshold) {
           console.warn(`^6NEONDB: ^7Slow query detected (${executionTime}ms):`, convertedQuery.substring(0, 100));
         }
-        if (this.debugMode) {
-          console.log(`^6NEONDB: ^7Query executed in ${executionTime}ms:`, convertedQuery.substring(0, 100));
-        }
         const rows = result.rows || [];
         if (callback) callback(rows);
         return rows;
       } catch (error) {
         console.error('^6NEONDB: ^7Query error:', error.message);
-        console.error('^6NEONDB: ^7Query:', convertedQuery);
-        console.error('^6NEONDB: ^7Parameters:', parsedParams);
-        if (callback) callback([]);
-        return Promise.reject(error);
-      }
-    }
-    async rawQuery(query, parameters = [], callback = null) {
-      if (!this.isReady) {
-        const error = 'Database not ready';
-        if (callback) callback([]);
-        return Promise.reject(new Error(error));
-      }
-      const startTime = Date.now();
-      const parsedParams = this.parseParameters(parameters);
-      try {
-        const client = await this.pool.connect();
-        const result = await client.query(query, parsedParams);
-        client.release();
-        const executionTime = Date.now() - startTime;
-        this.queryCount++;
-        const rows = result.rows || [];
-        if (callback) callback(rows);
-        return rows;
-      } catch (error) {
-        console.error('^6NEONDB: ^7Raw query error:', error.message);
         if (callback) callback([]);
         return Promise.reject(error);
       }
@@ -7149,8 +6935,6 @@
     async insert(query, parameters = [], callback = null) {
       try {
         let modifiedQuery = query;
-
-        // Make sure RETURNING id is added
         if (!modifiedQuery.toLowerCase().includes('returning')) {
           modifiedQuery += ' RETURNING id';
         }
@@ -7159,43 +6943,6 @@
         if (callback) callback(insertId);
         return insertId;
       } catch (error) {
-        // Special handling for ID constraint violation
-        if (error.message && error.message.includes('violates not-null constraint') && error.message.includes('column "id"')) {
-          try {
-            const tableNameMatch = query.match(/^\s*INSERT\s+INTO\s+([^\s(]+)/i);
-            if (tableNameMatch) {
-              const tableName = tableNameMatch[1].replace(/"/g, '').replace(/`/g, '');
-
-              // First, get the maximum ID from the table
-              const client = await this.pool.connect();
-              const maxIdResult = await client.query(`SELECT COALESCE(MAX(id), 0) + 1 as next_id FROM ${tableName}`);
-              const nextId = maxIdResult.rows[0].next_id;
-
-              // Extract column list
-              const columnMatch = query.match(/\(([^)]+)\)/);
-              if (columnMatch) {
-                const columns = columnMatch[1].trim();
-
-                // Create a new query with explicit ID
-                const modifiedQuery = `
-                            INSERT INTO ${tableName} 
-                            (id, ${columns}) 
-                            VALUES 
-                            (${nextId}, ${this.parseParameters(parameters).map((_, i) => `$${i + 1}`).join(', ')})
-                            RETURNING id
-                        `;
-                const result = await client.query(modifiedQuery, this.parseParameters(parameters));
-                client.release();
-                const insertId = result.rows[0].id || nextId;
-                console.log(`^6NEONDB: ^7Auto-fixed INSERT query using MAX(id)+1 = ${nextId}`);
-                if (callback) callback(insertId);
-                return insertId;
-              }
-            }
-          } catch (retryError) {
-            console.error('^6NEONDB: ^7Failed to auto-fix INSERT query:', retryError.message);
-          }
-        }
         if (callback) callback(false);
         return Promise.reject(error);
       }
@@ -7203,33 +6950,19 @@
     async update(query, parameters = [], callback = null) {
       try {
         const result = await this.execute(query, parameters);
-        const affectedRows = result.affectedRows;
-        if (callback) callback(affectedRows);
-        return affectedRows;
+        if (callback) callback(result.affectedRows);
+        return result.affectedRows;
       } catch (error) {
-        if (callback) callback(false);
-        return Promise.reject(error);
-      }
-    }
-    async prepare(name, query, callback = null) {
-      try {
-        const convertedQuery = this.convertMySQLToPostgreSQL(query);
-        this.preparedStatements.set(name, convertedQuery);
-        if (callback) callback(true);
-        return true;
-      } catch (error) {
-        console.error('^6NEONDB: ^7Prepare error:', error.message);
         if (callback) callback(false);
         return Promise.reject(error);
       }
     }
     async transaction(queries, callback = null) {
       if (!this.isReady) {
-        const error = 'Database not ready';
-        if (callback) callback(false, error);
-        return Promise.reject(new Error(error));
+        if (callback) callback(false, 'Database not ready');
+        return Promise.reject(new Error('Database not ready'));
       }
-      const client = await this.pool.connect();
+      const client = await this.getClient();
       const results = [];
       try {
         await client.query('BEGIN');
@@ -7256,51 +6989,27 @@
           });
         }
         await client.query('COMMIT');
-        client.release();
         if (callback) callback(results);
         return results;
       } catch (error) {
         await client.query('ROLLBACK');
-        client.release();
         console.error('^6NEONDB: ^7Transaction error:', error.message);
         if (callback) callback(false, error.message);
         return Promise.reject(error);
+      } finally {
+        client.release();
       }
     }
-    async store(name, query, parameters = [], callback = null) {
+    async prepare(name, query, callback = null) {
       try {
-        this.preparedStatements.set(name, {
-          query: this.convertMySQLToPostgreSQL(query),
-          parameters: this.parseParameters(parameters)
-        });
+        this.preparedStatements.set(name, this.convertMySQLToPostgreSQL(query));
         if (callback) callback(true);
         return true;
       } catch (error) {
-        console.error('^6NEONDB: ^7Store error:', error.message);
+        console.error('^6NEONDB: ^7Prepare error:', error.message);
         if (callback) callback(false);
         return Promise.reject(error);
       }
-    }
-    getBooleanColumnPatterns() {
-      return ['enabled', 'enable', 'disabled', 'disable', 'active', 'inactive', 'is_active', 'is_enabled', 'visible', 'hidden', 'is_visible', 'is_hidden', 'online', 'offline', 'is_online', 'banned', 'is_banned', 'locked', 'is_locked', 'verified', 'is_verified', 'approved', 'is_approved', 'deleted', 'is_deleted', 'archived', 'is_archived', 'public', 'private', 'is_public', 'is_private', 'for_sale', 'available', 'is_available', 'completed', 'is_completed', 'finished', 'is_finished'];
-    }
-    getInsertId(result) {
-      if (result.rows && result.rows.length > 0) {
-        const row = result.rows[0];
-        // Check for common ID column names
-        if (row.id !== undefined) return row.id;
-        if (row.ID !== undefined) return row.ID;
-        if (row.Id !== undefined) return row.Id;
-        if (row.insertid !== undefined) return row.insertid;
-        if (row.insertId !== undefined) return row.insertId;
-        if (row.insert_id !== undefined) return row.insert_id;
-        if (row.lastval !== undefined) return row.lastval;
-
-        // If we can't find a specific ID column, return the first column's value
-        const firstKey = Object.keys(row)[0];
-        return row[firstKey];
-      }
-      return null;
     }
     ready(callback = null) {
       if (callback) {
@@ -7325,13 +7034,18 @@
         queryCount: this.queryCount,
         poolSize: this.pool ? this.pool.totalCount : 0,
         idleConnections: this.pool ? this.pool.idleCount : 0,
-        waitingClients: this.pool ? this.pool.waitingCount : 0
+        waitingClients: this.pool ? this.pool.waitingCount : 0,
+        coldStarts: this.metrics.coldStarts,
+        reconnects: this.metrics.reconnects,
+        lastConnectTime: this.metrics.lastConnectTime,
+        batchingEnabled: this.batchingEnabled,
+        warmupEnabled: this.warmupEnabled
       };
     }
   }
 
   // Initialize the database
-  const oxpgsql = new OxPgSQL();
+  const oxpgsql = new NeonPgSQL();
 
   // Export functions
   global.exports('execute', (query, parameters, callback) => {
@@ -7362,13 +7076,13 @@
     oxpgsql.ready(callback);
   });
   global.exports('rawExecute', (query, parameters, callback) => {
-    oxpgsql.rawExecute(query, parameters, callback);
+    oxpgsql.execute(query, parameters, callback);
   });
   global.exports('rawQuery', (query, parameters, callback) => {
-    oxpgsql.rawQuery(query, parameters, callback);
+    oxpgsql.query(query, parameters, callback);
   });
   global.exports('store', (name, query, parameters, callback) => {
-    oxpgsql.store(name, query, parameters, callback);
+    oxpgsql.prepare(name, query, callback);
   });
   global.exports('parseParameters', parameters => {
     return oxpgsql.parseParameters(parameters);
@@ -7388,10 +7102,6 @@
     }
     process.exit(0);
   });
-  function fixBooleanQuery(query) {
-    // Replace integer comparisons with boolean comparisons
-    return query.replace(/\b(\w+)\s*=\s*1\b(?!\d)/g, '$1 = true').replace(/\b(\w+)\s*=\s*0\b(?!\d)/g, '$1 = false');
-  }
   console.log('^6NEONDB: ^7PostgreSQL wrapper loaded - waiting for database connection...');
   module.exports = __webpack_exports__;
   /******/
