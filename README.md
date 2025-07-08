@@ -27,12 +27,8 @@
 ## 🛠️ Installation
 
 1. **Download and Extract** the resource to your FiveM server's resources folder
-2. **Install Dependencies**:
-   ```bash
-   cd resources/neondb
-   npm install pg
-   ```
-3. **Add to server.cfg**:
+
+2. **Add to server.cfg**:
    ```
    start neondb
    ```
