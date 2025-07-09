@@ -6314,7 +6314,7 @@
     Pool,
     Client
   } = __webpack_require__(1596);
-  class NeonPgSQL {
+  class NEONDB {
     constructor() {
       this.pool = null;
       this.isReady = false;
@@ -6354,6 +6354,168 @@
       };
       this.init();
     }
+
+    // SQL Builder Methods
+    select(table, columns = '*', where = null, orderBy = null, limit = null) {
+      let query = `SELECT ${Array.isArray(columns) ? columns.join(', ') : columns} FROM ${table}`;
+      const params = [];
+      let paramIndex = 1;
+      if (where) {
+        if (typeof where === 'string') {
+          query += ` WHERE ${where}`;
+        } else if (typeof where === 'object') {
+          const conditions = [];
+          for (const [key, value] of Object.entries(where)) {
+            conditions.push(`${key} = $${paramIndex++}`);
+            params.push(value);
+          }
+          query += ` WHERE ${conditions.join(' AND ')}`;
+        }
+      }
+      if (orderBy) {
+        query += ` ORDER BY ${orderBy}`;
+      }
+      if (limit) {
+        query += ` LIMIT ${limit}`;
+      }
+      return this.query(query, params);
+    }
+    insert(table, data) {
+      const columns = Object.keys(data);
+      const values = Object.values(data);
+      const placeholders = values.map((_, i) => `$${i + 1}`).join(', ');
+      const query = `INSERT INTO ${table} (${columns.join(', ')}) VALUES (${placeholders}) RETURNING id`;
+      return this.execute(query, values);
+    }
+    update(table, data, where) {
+      const updates = [];
+      const params = [];
+      let paramIndex = 1;
+      for (const [key, value] of Object.entries(data)) {
+        updates.push(`${key} = $${paramIndex++}`);
+        params.push(value);
+      }
+      let query = `UPDATE ${table} SET ${updates.join(', ')}`;
+      if (where) {
+        if (typeof where === 'string') {
+          query += ` WHERE ${where}`;
+        } else if (typeof where === 'object') {
+          const conditions = [];
+          for (const [key, value] of Object.entries(where)) {
+            conditions.push(`${key} = $${paramIndex++}`);
+            params.push(value);
+          }
+          query += ` WHERE ${conditions.join(' AND ')}`;
+        }
+      }
+      return this.execute(query, params);
+    }
+    delete(table, where) {
+      const params = [];
+      let paramIndex = 1;
+      let query = `DELETE FROM ${table}`;
+      if (where) {
+        if (typeof where === 'string') {
+          query += ` WHERE ${where}`;
+        } else if (typeof where === 'object') {
+          const conditions = [];
+          for (const [key, value] of Object.entries(where)) {
+            conditions.push(`${key} = $${paramIndex++}`);
+            params.push(value);
+          }
+          query += ` WHERE ${conditions.join(' AND ')}`;
+        }
+      }
+      return this.execute(query, params);
+    }
+    createTable(tableName, columns, options = {}) {
+      let query = `CREATE TABLE ${options.ifNotExists ? 'IF NOT EXISTS ' : ''}${tableName} (`;
+      const columnDefs = [];
+      for (const [name, definition] of Object.entries(columns)) {
+        columnDefs.push(`${name} ${definition}`);
+      }
+      query += columnDefs.join(', ');
+      query += ')';
+      return this.execute(query);
+    }
+    dropTable(tableName, ifExists = true) {
+      const query = `DROP TABLE ${ifExists ? 'IF EXISTS ' : ''}${tableName}`;
+      return this.execute(query);
+    }
+
+    // Get the calling resource and file information
+    getCallerInfo() {
+      try {
+        // Get current resource name
+        const resourceName = GetCurrentResourceName();
+
+        // Get stack trace info from FiveM's debug system
+        const stackInfo = debug.getinfo(3, 'Sl');
+        if (stackInfo && stackInfo.source) {
+          // Clean up the source path to show just the file name
+          const fileName = stackInfo.source.replace(/^@/, '').split('/').pop();
+          const lineNumber = stackInfo.currentline || 'unknown';
+          return {
+            resource: resourceName,
+            file: fileName,
+            line: lineNumber,
+            location: `${resourceName}/${fileName}:${lineNumber}`
+          };
+        }
+        return {
+          resource: resourceName,
+          file: 'unknown',
+          line: 'unknown',
+          location: `${resourceName}/unknown:unknown`
+        };
+      } catch (error) {
+        return {
+          resource: 'unknown',
+          file: 'unknown',
+          line: 'unknown',
+          location: 'unknown/unknown:unknown'
+        };
+      }
+    }
+
+    // Create enhanced error with FiveM-specific caller info
+    createEnhancedError(originalError, query, parameters, callerInfo) {
+      const enhancedError = new Error(originalError.message);
+      enhancedError.name = originalError.name;
+      enhancedError.code = originalError.code;
+      enhancedError.detail = originalError.detail;
+      enhancedError.hint = originalError.hint;
+      enhancedError.position = originalError.position;
+      enhancedError.query = query;
+      enhancedError.parameters = parameters;
+      enhancedError.callerInfo = callerInfo;
+
+      // Create a more meaningful stack trace
+      const stackLines = [`${enhancedError.name}: ${enhancedError.message}`, `    at ${callerInfo.location}`, `    Query: ${query.substring(0, 100)}${query.length > 100 ? '...' : ''}`, `    Parameters: ${JSON.stringify(parameters)}`];
+      enhancedError.stack = stackLines.join('\n');
+      return enhancedError;
+    }
+
+    // Log error with detailed information
+    logError(error, operation = 'Database Operation') {
+      console.error(`^1[NEONDB] ^7${operation} failed:`);
+      console.error(`^1[NEONDB] ^7Error: ${error.message}`);
+      if (error.callerInfo) {
+        console.error(`^1[NEONDB] ^7Location: ${error.callerInfo.location}`);
+      }
+      if (error.query) {
+        console.error(`^1[NEONDB] ^7Query: ${error.query.substring(0, 200)}${error.query.length > 200 ? '...' : ''}`);
+      }
+      if (error.parameters && error.parameters.length > 0) {
+        console.error(`^1[NEONDB] ^7Parameters: ${JSON.stringify(error.parameters)}`);
+      }
+      if (error.detail) {
+        console.error(`^1[NEONDB] ^7Detail: ${error.detail}`);
+      }
+      if (error.hint) {
+        console.error(`^1[NEONDB] ^7Hint: ${error.hint}`);
+      }
+    }
     getConnectionConfig() {
       const connectionString = GetConvar('pgsql_connection_string', '');
       const config = connectionString ? {
@@ -6379,7 +6541,7 @@
         } : false,
         statement_timeout: GetConvarInt('pgsql_statement_timeout', 60000),
         query_timeout: GetConvarInt('pgsql_query_timeout', 60000),
-        application_name: 'FiveM-oxpgsql',
+        application_name: 'FiveM-NEONDB',
         // NeonDB optimizations
         keepAlive: true,
         keepAliveInitialDelayMillis: 10000
@@ -6562,9 +6724,11 @@
                 result: result
               });
             } catch (err) {
+              // Create enhanced error with caller info
+              const enhancedError = this.createEnhancedError(err, item.query, item.params, item.callerInfo);
               item.resolve({
                 success: false,
-                error: err
+                error: enhancedError
               });
             }
           }
@@ -6573,9 +6737,10 @@
           await client.query('ROLLBACK').catch(() => { });
           for (const item of batch) {
             if (!item.processed) {
+              const enhancedError = this.createEnhancedError(error, item.query, item.params, item.callerInfo);
               item.resolve({
                 success: false,
-                error: error
+                error: enhancedError
               });
             }
           }
@@ -6584,18 +6749,20 @@
         }
       }).catch(error => {
         for (const item of batch) {
+          const enhancedError = this.createEnhancedError(error, item.query, item.params, item.callerInfo);
           item.resolve({
             success: false,
-            error: error
+            error: enhancedError
           });
         }
       });
     }
-    addToBatch(query, params) {
+    addToBatch(query, params, callerInfo) {
       return new Promise(resolve => {
         this.queryBatch.push({
           query,
           params,
+          callerInfo,
           resolve,
           processed: false
         });
@@ -6722,7 +6889,7 @@
       }
       return null;
     }
-    async handleQueryError(error, query, params, startTime) {
+    async handleQueryError(error, query, params, startTime, callerInfo) {
       // Handle NOT NULL constraint violations for INSERT queries
       if (error.message.includes('violates not-null constraint') && query.toLowerCase().includes('insert into')) {
         // Extract table name from query
@@ -6767,7 +6934,9 @@
               executionTime: Date.now() - startTime
             };
           } catch (fixError) {
-            console.error('^1[oxpgsql] ^7Failed to fix INSERT query:', fixError.message);
+            const enhancedError = this.createEnhancedError(fixError, fixedQuery, [uniqueId, ...params], callerInfo);
+            this.logError(enhancedError, 'INSERT Fix');
+            throw enhancedError;
           }
         }
       }
@@ -6800,7 +6969,9 @@
                 executionTime: Date.now() - startTime
               };
             } catch (retryError) {
-              console.error('^1[oxpgsql] ^7Failed to retry after duplicate key:', retryError.message);
+              const enhancedError = this.createEnhancedError(retryError, query, newParams, callerInfo);
+              this.logError(enhancedError, 'Duplicate Key Retry');
+              throw enhancedError;
             }
           }
         }
@@ -6808,10 +6979,13 @@
       return null;
     }
     async execute(query, parameters = [], callback = null) {
+      const callerInfo = this.getCallerInfo();
       if (!this.isReady) {
-        const error = 'Database not ready';
-        if (callback) callback(false, error);
-        return Promise.reject(new Error(error));
+        const error = new Error('Database not ready');
+        const enhancedError = this.createEnhancedError(error, query, parameters, callerInfo);
+        this.logError(enhancedError, 'Execute');
+        if (callback) callback(false, enhancedError.message);
+        return Promise.reject(enhancedError);
       }
       const startTime = Date.now();
       const parsedParams = this.parseParameters(parameters);
@@ -6824,8 +6998,11 @@
             success,
             result,
             error
-          } = await this.addToBatch(convertedQuery, parsedParams);
-          if (!success) throw error;
+          } = await this.addToBatch(convertedQuery, parsedParams, callerInfo);
+          if (!success) {
+            this.logError(error, 'Execute (Batch)');
+            throw error;
+          }
           const response = {
             affectedRows: result.rowCount || 0,
             insertId: this.getInsertId(result),
@@ -6852,7 +7029,7 @@
         const executionTime = Date.now() - startTime;
         this.queryCount++;
         if (executionTime > this.slowQueryThreshold) {
-          console.warn(`^3[oxpgsql] ^7Slow query detected (${executionTime}ms):`, convertedQuery.substring(0, 100));
+          console.warn(`^3[NEONDB] ^7Slow query detected (${executionTime}ms) at ${callerInfo.location}:`, convertedQuery.substring(0, 100));
         }
         const response = {
           affectedRows: result.rowCount || 0,
@@ -6867,22 +7044,31 @@
         if (callback) callback(response);
         return response;
       } catch (error) {
-        console.error('^1[oxpgsql] ^7Execute error:', error.message);
+        const enhancedError = this.createEnhancedError(error, convertedQuery, parsedParams, callerInfo);
+        this.logError(enhancedError, 'Execute');
 
         // Try to handle the error generically
-        const fixedResponse = await this.handleQueryError(error, convertedQuery, parsedParams, startTime);
-        if (fixedResponse) {
-          if (callback) callback(fixedResponse);
-          return fixedResponse;
+        try {
+          const fixedResponse = await this.handleQueryError(enhancedError, convertedQuery, parsedParams, startTime, callerInfo);
+          if (fixedResponse) {
+            if (callback) callback(fixedResponse);
+            return fixedResponse;
+          }
+        } catch (fixError) {
+          // If fixing fails, continue with original error
         }
-        if (callback) callback(false, error.message);
-        return Promise.reject(error);
+        if (callback) callback(false, enhancedError.message);
+        return Promise.reject(enhancedError);
       }
     }
     async query(query, parameters = [], callback = null) {
+      const callerInfo = this.getCallerInfo();
       if (!this.isReady) {
+        const error = new Error('Database not ready');
+        const enhancedError = this.createEnhancedError(error, query, parameters, callerInfo);
+        this.logError(enhancedError, 'Query');
         if (callback) callback([]);
-        return Promise.reject(new Error('Database not ready'));
+        return Promise.reject(enhancedError);
       }
       const startTime = Date.now();
       const parsedParams = this.parseParameters(parameters);
@@ -6894,15 +7080,16 @@
         const executionTime = Date.now() - startTime;
         this.queryCount++;
         if (executionTime > this.slowQueryThreshold) {
-          console.warn(`^6NEONDB: ^7Slow query detected (${executionTime}ms):`, convertedQuery.substring(0, 100));
+          console.warn(`^6NEONDB: ^7Slow query detected (${executionTime}ms) at ${callerInfo.location}:`, convertedQuery.substring(0, 100));
         }
         const rows = result.rows || [];
         if (callback) callback(rows);
         return rows;
       } catch (error) {
-        console.error('^6NEONDB: ^7Query error:', error.message);
+        const enhancedError = this.createEnhancedError(error, convertedQuery, parsedParams, callerInfo);
+        this.logError(enhancedError, 'Query');
         if (callback) callback([]);
-        return Promise.reject(error);
+        return Promise.reject(enhancedError);
       }
     }
     async single(query, parameters = [], callback = null) {
@@ -6932,7 +7119,7 @@
         return Promise.reject(error);
       }
     }
-    async insert(query, parameters = [], callback = null) {
+    async insertQuery(query, parameters = [], callback = null) {
       try {
         let modifiedQuery = query;
         if (!modifiedQuery.toLowerCase().includes('returning')) {
@@ -6947,7 +7134,7 @@
         return Promise.reject(error);
       }
     }
-    async update(query, parameters = [], callback = null) {
+    async updateQuery(query, parameters = [], callback = null) {
       try {
         const result = await this.execute(query, parameters);
         if (callback) callback(result.affectedRows);
@@ -6958,9 +7145,13 @@
       }
     }
     async transaction(queries, callback = null) {
+      const callerInfo = this.getCallerInfo();
       if (!this.isReady) {
-        if (callback) callback(false, 'Database not ready');
-        return Promise.reject(new Error('Database not ready'));
+        const error = new Error('Database not ready');
+        const enhancedError = this.createEnhancedError(error, 'TRANSACTION', queries, callerInfo);
+        this.logError(enhancedError, 'Transaction');
+        if (callback) callback(false, enhancedError.message);
+        return Promise.reject(enhancedError);
       }
       const client = await this.getClient();
       const results = [];
@@ -6993,22 +7184,25 @@
         return results;
       } catch (error) {
         await client.query('ROLLBACK');
-        console.error('^6NEONDB: ^7Transaction error:', error.message);
-        if (callback) callback(false, error.message);
-        return Promise.reject(error);
+        const enhancedError = this.createEnhancedError(error, 'TRANSACTION', queries, callerInfo);
+        this.logError(enhancedError, 'Transaction');
+        if (callback) callback(false, enhancedError.message);
+        return Promise.reject(enhancedError);
       } finally {
         client.release();
       }
     }
     async prepare(name, query, callback = null) {
+      const callerInfo = this.getCallerInfo();
       try {
         this.preparedStatements.set(name, this.convertMySQLToPostgreSQL(query));
         if (callback) callback(true);
         return true;
       } catch (error) {
-        console.error('^6NEONDB: ^7Prepare error:', error.message);
+        const enhancedError = this.createEnhancedError(error, query, [], callerInfo);
+        this.logError(enhancedError, 'Prepare');
         if (callback) callback(false);
-        return Promise.reject(error);
+        return Promise.reject(enhancedError);
       }
     }
     ready(callback = null) {
@@ -7045,62 +7239,70 @@
   }
 
   // Initialize the database
-  const oxpgsql = new NeonPgSQL();
+  const neondb = new NEONDB();
 
-  // Export functions
-  global.exports('execute', (query, parameters, callback) => {
-    oxpgsql.execute(query, parameters, callback);
-  });
-  global.exports('query', (query, parameters, callback) => {
-    oxpgsql.query(query, parameters, callback);
-  });
-  global.exports('single', (query, parameters, callback) => {
-    oxpgsql.single(query, parameters, callback);
-  });
-  global.exports('scalar', (query, parameters, callback) => {
-    oxpgsql.scalar(query, parameters, callback);
-  });
-  global.exports('insert', (query, parameters, callback) => {
-    oxpgsql.insert(query, parameters, callback);
-  });
-  global.exports('update', (query, parameters, callback) => {
-    oxpgsql.update(query, parameters, callback);
-  });
-  global.exports('prepare', (name, query, callback) => {
-    oxpgsql.prepare(name, query, callback);
-  });
-  global.exports('transaction', (queries, callback) => {
-    oxpgsql.transaction(queries, callback);
-  });
-  global.exports('ready', callback => {
-    oxpgsql.ready(callback);
-  });
-  global.exports('rawExecute', (query, parameters, callback) => {
-    oxpgsql.execute(query, parameters, callback);
-  });
-  global.exports('rawQuery', (query, parameters, callback) => {
-    oxpgsql.query(query, parameters, callback);
-  });
-  global.exports('store', (name, query, parameters, callback) => {
-    oxpgsql.prepare(name, query, callback);
-  });
+  // Enhanced export functions with better error handling
+  function safeExecute(fn, name) {
+    return function (...args) {
+      try {
+        return fn.apply(neondb, args);
+      } catch (error) {
+        console.error(`^1[NEONDB] ^7${name} failed:`, error.message);
+        const callback = args[args.length - 1];
+        if (typeof callback === 'function') {
+          callback(false, error.message);
+        }
+        throw error;
+      }
+    };
+  }
+
+  // Export functions with enhanced error handling
+  global.exports('execute', safeExecute(neondb.execute.bind(neondb), 'execute'));
+  global.exports('query', safeExecute(neondb.query.bind(neondb), 'query'));
+  global.exports('single', safeExecute(neondb.single.bind(neondb), 'single'));
+  global.exports('scalar', safeExecute(neondb.scalar.bind(neondb), 'scalar'));
+  global.exports('insert', safeExecute(neondb.insertQuery.bind(neondb), 'insert'));
+  global.exports('update', safeExecute(neondb.updateQuery.bind(neondb), 'update'));
+  global.exports('prepare', safeExecute(neondb.prepare.bind(neondb), 'prepare'));
+  global.exports('transaction', safeExecute(neondb.transaction.bind(neondb), 'transaction'));
+  global.exports('ready', safeExecute(neondb.ready.bind(neondb), 'ready'));
+  global.exports('rawExecute', safeExecute(neondb.execute.bind(neondb), 'rawExecute'));
+  global.exports('rawQuery', safeExecute(neondb.query.bind(neondb), 'rawQuery'));
+  global.exports('store', safeExecute(neondb.prepare.bind(neondb), 'store'));
+
+  // Export SQL Builder functions
+  global.exports('select', safeExecute(neondb.select.bind(neondb), 'select'));
+  global.exports('insertInto', safeExecute(neondb.insert.bind(neondb), 'insertInto'));
+  global.exports('updateTable', safeExecute(neondb.update.bind(neondb), 'updateTable'));
+  global.exports('deleteFrom', safeExecute(neondb.delete.bind(neondb), 'deleteFrom'));
+  global.exports('createTable', safeExecute(neondb.createTable.bind(neondb), 'createTable'));
+  global.exports('dropTable', safeExecute(neondb.dropTable.bind(neondb), 'dropTable'));
   global.exports('parseParameters', parameters => {
-    return oxpgsql.parseParameters(parameters);
+    return neondb.parseParameters(parameters);
   });
 
   // Status command
-  RegisterCommand('oxpgsql:status', () => {
-    const status = oxpgsql.getStatus();
+  RegisterCommand('neondb:status', () => {
+    const status = neondb.getStatus();
     console.log('^6NEONDB: ^7Status:', JSON.stringify(status, null, 2));
   }, true);
 
   // Graceful shutdown
   process.on('SIGINT', async () => {
     console.log('^6NEONDB: ^7Shutting down gracefully...');
-    if (oxpgsql.pool) {
-      await oxpgsql.pool.end();
+    if (neondb.pool) {
+      await neondb.pool.end();
     }
     process.exit(0);
+  });
+
+  // Handle unhandled promise rejections
+  process.on('unhandledRejection', (reason, promise) => {
+    console.error('^1[NEONDB] ^7Unhandled Promise Rejection:', reason);
+    if (reason && reason.callerInfo) {
+      console.error(`^1[NEONDB] ^7Location: ${reason.callerInfo.location}`);
+    }
   });
   console.log('^6NEONDB: ^7PostgreSQL wrapper loaded - waiting for database connection...');
   module.exports = __webpack_exports__;
