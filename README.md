@@ -58,7 +58,7 @@ start neondb
 ### **Method 2: Build from Source**
 ```bash
 # Clone and build
-git clone https://github.com/yourusername/neondb.git
+git clone https://github.com/raisen1337/neondb.git
 cd neondb
 npm install
 npm run build
@@ -853,7 +853,7 @@ set pgsql_connection_string "postgresql://user:pass@host:5432/db?sslmode=require
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/neondb.git
+git clone https://github.com/raisen1337/neondb.git
 cd neondb
 
 # Install dependencies
@@ -886,9 +886,9 @@ When reporting issues, please include:
 ### **Community Support**
 
 - 💬 **Discord:** [Join our community](https://discord.gg/fivem)
-- � **Documentation:** [Full API docs](https://github.com/yourusername/neondb/wiki)
-- 🐛 **Issues:** [Report bugs](https://github.com/yourusername/neondb/issues)
-- 💡 **Feature Requests:** [Suggest improvements](https://github.com/yourusername/neondb/discussions)
+<!-- - � **Documentation:** [Full API docs](https://github.com/yourusername/neondb/wiki) -->
+- 🐛 **Issues:** [Report bugs](https://github.com/raisen1337/neondb/issues)
+- 💡 **Feature Requests:** [Suggest improvements](https://github.com/raisen1337/neondb/discussions)
 
 ## �📄 License & Legal
 
@@ -930,8 +930,8 @@ This software is provided "as is" without warranty of any kind. Use at your own 
 
 **Experience enterprise-grade database performance with zero migration effort**
 
-[![Download Now](https://img.shields.io/badge/Download-Latest%20Release-success?style=for-the-badge)](https://github.com/yourusername/neondb/releases)
-[![Documentation](https://img.shields.io/badge/Read-Documentation-blue?style=for-the-badge)](https://github.com/yourusername/neondb/wiki)
+[![Download Now](https://img.shields.io/badge/Download-Latest%20Release-success?style=for-the-badge)](https://github.com/raisen1337/neondb/tree/main)
+
 [![Discord](https://img.shields.io/badge/Join-Discord-blurple?style=for-the-badge)](https://discord.gg/fivem)
 
 *If this project helped you, please consider giving it a ⭐ star on GitHub!*
